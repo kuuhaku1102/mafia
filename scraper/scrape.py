@@ -123,87 +123,111 @@ def expected_count(html: str) -> int | None:
 # Playwright で全ページ巡回
 # ---------------------------------------------------------------------------
 def scrape_all() -> list[dict]:
-    from playwright.sync_api import TimeoutError as PWTimeout
     from playwright.sync_api import sync_playwright
 
     all_items: list[dict] = []
     seen = set()
     seen_pages: set[str] = set()
-    last_html = None
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(args=["--no-sandbox"])
-        page = browser.new_page(user_agent=USER_AGENT, locale="ja-JP")
-        log(f"アクセス: {BASE_URL}")
-        page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
-
-        # 商品リストの描画を待つ
+        browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+        page = browser.new_page(
+            user_agent=USER_AGENT,
+            locale="ja-JP",
+            viewport={"width": 1366, "height": 900},
+        )
         try:
-            page.wait_for_selector("#cardList li.item, #listView li.item", timeout=30000)
-        except PWTimeout:
-            log("! 商品リストが表示されませんでした。")
+            _scrape_loop(page, all_items, seen, seen_pages)
+        except Exception as exc:  # 失敗時はHTML/スクショを保存して原因調査できるように
+            import traceback
 
-        total = expected_count(page.content())
-        if total:
-            log(f"総件数(itemCount): {total} 件")
+            log(f"! スクレイピング中に例外: {exc}")
+            log(traceback.format_exc())
+            _dump_debug(page)
+        finally:
+            browser.close()
 
-        for n in range(1, MAX_PAGES + 1):
-            cur = _current_page(page)
-            html = page.content()
-            last_html = html
+    if not all_items:
+        log("! 抽出0件でした。debug_page.html / debug_screenshot.png を確認してください。")
 
-            page_items = parse_items(html)
-            new_items = []
-            for it in page_items:
-                key = (it["商品名"], it["グレード"], it["買取価格"], it["画像URL"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                new_items.append(it)
-            all_items.extend(new_items)
-            log(f"[page {cur or n}] {len(page_items)} 件 (新規 {len(new_items)}, 累計 {len(all_items)})")
+    return all_items
 
-            seen_pages.add(cur or str(n))
 
-            # 「次へ」ボタンの状態を確認
-            next_btn = page.query_selector(".pagination .pager.next")
-            if not next_btn:
-                break
-            cls = next_btn.get_attribute("class") or ""
-            if "disabled" in cls:
-                break
-
-            next_btn.click()
-            # 現在ページ番号が変わるまで待機
-            try:
-                page.wait_for_function(
-                    """(prev) => {
-                        const el = document.querySelector('.pagination .page.current');
-                        return el && el.innerText.trim() !== prev;
-                    }""",
-                    arg=(cur or ""),
-                    timeout=15000,
-                )
-            except PWTimeout:
-                log("  次ページへの遷移を確認できませんでした。終了。")
-                break
-
-            if _current_page(page) in seen_pages:
-                log("  既知のページに戻りました。終了。")
-                break
-            time.sleep(REQUEST_DELAY)
-
-        browser.close()
-
-    if not all_items and last_html:
+def _dump_debug(page) -> None:
+    try:
         with open("debug_page.html", "w", encoding="utf-8") as f:
-            f.write(last_html)
-        log("! 抽出0件。debug_page.html を保存しました。")
+            f.write(page.content())
+        page.screenshot(path="debug_screenshot.png", full_page=True)
+        log("  debug_page.html / debug_screenshot.png を保存しました。")
+    except Exception as exc:
+        log(f"  デバッグ情報の保存に失敗: {exc}")
+
+
+def _scrape_loop(page, all_items, seen, seen_pages) -> None:
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    log(f"アクセス: {BASE_URL}")
+    # networkidle は解析タグ等で確定しないことがあるため domcontentloaded を使う
+    page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
+
+    # 商品リストの描画(AJAX)を待つ
+    try:
+        page.wait_for_selector("#cardList li.item, #listView li.item", timeout=45000)
+    except PWTimeout:
+        log("! 商品リストが表示されませんでした(タイムアウト)。")
+        _dump_debug(page)
+
+    total = expected_count(page.content())
+    if total:
+        log(f"総件数(itemCount): {total} 件")
+
+    for n in range(1, MAX_PAGES + 1):
+        cur = _current_page(page)
+        html = page.content()
+
+        page_items = parse_items(html)
+        new_items = []
+        for it in page_items:
+            key = (it["商品名"], it["グレード"], it["買取価格"], it["画像URL"])
+            if key in seen:
+                continue
+            seen.add(key)
+            new_items.append(it)
+        all_items.extend(new_items)
+        log(f"[page {cur or n}] {len(page_items)} 件 (新規 {len(new_items)}, 累計 {len(all_items)})")
+
+        seen_pages.add(cur or str(n))
+
+        # 「次へ」ボタンの状態を確認
+        next_btn = page.query_selector(".pagination .pager.next")
+        if not next_btn:
+            break
+        cls = next_btn.get_attribute("class") or ""
+        if "disabled" in cls:
+            break
+
+        next_btn.click()
+        # 現在ページ番号が変わるまで待機
+        try:
+            page.wait_for_function(
+                """(prev) => {
+                    const el = document.querySelector('.pagination .page.current');
+                    return el && el.innerText.trim() !== prev;
+                }""",
+                arg=(cur or ""),
+                timeout=15000,
+            )
+        except PWTimeout:
+            log("  次ページへの遷移を確認できませんでした。終了。")
+            break
+
+        if _current_page(page) in seen_pages:
+            log("  既知のページに戻りました。終了。")
+            break
+        time.sleep(REQUEST_DELAY)
 
     if total and len(all_items) < total:
         log(f"! 注意: 取得 {len(all_items)} 件 < 総件数 {total} 件。巡回漏れの可能性。")
-
-    return all_items
 
 
 def _current_page(page) -> str | None:
@@ -258,15 +282,24 @@ def write_to_sheets(items: list[dict]) -> None:
 # main
 # ---------------------------------------------------------------------------
 def main() -> int:
+    dry_run = os.environ.get("DRY_RUN") == "1"
+
+    # 書き込みありなのに鍵が無い場合は、スクレイピング前に明確に失敗させる
+    if not dry_run and not os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        log("ERROR: GOOGLE_SERVICE_ACCOUNT_JSON が未設定です。")
+        log("  リポジトリの Settings → Secrets and variables → Actions に登録してください。")
+        log("  (スクレイピングのみ確認したい場合は DRY_RUN=1 で実行)")
+        return 1
+
     log(f"=== スクレイピング開始: {BASE_URL} ===")
     items = scrape_all()
     log(f"=== 取得合計: {len(items)} 件 ===")
 
     if not items:
-        log("ERROR: データを取得できませんでした。")
+        log("ERROR: データを取得できませんでした。debug_page.html / debug_screenshot.png を確認してください。")
         return 1
 
-    if os.environ.get("DRY_RUN") == "1":
+    if dry_run:
         log("DRY_RUN=1 のため書き込みはスキップします。サンプル:")
         for it in items[:5]:
             log(f"  {it}")

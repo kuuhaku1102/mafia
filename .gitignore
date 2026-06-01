@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 debug_page.html
+debug_screenshot.png
 service_account.json
 .venv/
 .env

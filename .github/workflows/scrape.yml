@@ -49,11 +49,13 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
         run: python scraper/scrape.py
 
-      - name: Upload debug HTML on failure
+      - name: Upload debug artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: debug-page
-          path: debug_page.html
+          path: |
+            debug_page.html
+            debug_screenshot.png
           if-no-files-found: ignore
           retention-days: 7
