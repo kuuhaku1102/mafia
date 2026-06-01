@@ -1,0 +1,52 @@
+name: 買取リスト スクレイピング
+
+on:
+  schedule:
+    # 毎日 10:00 JST = 01:00 UTC
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "スプレッドシートへ書き込まず動作確認のみ (1で有効)"
+        required: false
+        default: "0"
+
+# 同時実行を防止
+concurrency:
+  group: scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scraper/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r scraper/requirements.txt
+
+      - name: Run scraper
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          WORKSHEET_NAME: ${{ vars.WORKSHEET_NAME || '買取リスト' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+        run: python scraper/scrape.py
+
+      - name: Upload debug HTML on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-page
+          path: debug_page.html
+          if-no-files-found: ignore
+          retention-days: 7
