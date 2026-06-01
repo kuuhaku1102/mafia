@@ -10,8 +10,10 @@ Playwright のヘッドレスブラウザで「次へ」をたどって全ペー
 
 実行に必要な環境変数:
   GOOGLE_SERVICE_ACCOUNT_JSON  サービスアカウント鍵 (JSON文字列そのもの)
+
+任意の環境変数 (未指定時は下記デフォルトを使用):
   SPREADSHEET_ID               書き込み先スプレッドシートのID
-  WORKSHEET_NAME               シート(タブ)名 (省略時: "買取リスト")
+  WORKSHEET_NAME               シート(タブ)名 (省略時: "bank")
 
 任意:
   BASE_URL       既定: https://store.torecabank.com/kaitori_list
@@ -32,6 +34,10 @@ from bs4 import BeautifulSoup
 BASE_URL = os.environ.get("BASE_URL", "https://store.torecabank.com/kaitori_list")
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "100"))
 REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "1.0"))
+
+# 書き込み先 (環境変数で上書き可能)
+DEFAULT_SPREADSHEET_ID = "1XZQO4j7gu-p9IsK3sfaQp4q9O2bH893C2PMv2h_xqzE"
+DEFAULT_WORKSHEET_NAME = "bank"
 
 HEADERS = ["商品名", "グレード", "買取価格", "在庫", "受付状態", "画像URL", "取得日時"]
 
@@ -213,8 +219,8 @@ def write_to_sheets(items: list[dict]) -> None:
     from google.oauth2.service_account import Credentials
 
     sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-    spreadsheet_id = os.environ["SPREADSHEET_ID"]
-    worksheet_name = os.environ.get("WORKSHEET_NAME", "買取リスト")
+    spreadsheet_id = os.environ.get("SPREADSHEET_ID") or DEFAULT_SPREADSHEET_ID
+    worksheet_name = os.environ.get("WORKSHEET_NAME") or DEFAULT_WORKSHEET_NAME
 
     creds = Credentials.from_service_account_info(
         json.loads(sa_json),

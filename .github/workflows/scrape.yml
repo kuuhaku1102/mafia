@@ -43,8 +43,9 @@ jobs:
       - name: Run scraper
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          # 未設定の場合は scrape.py 内のデフォルト(指定スプレッドシート / bankシート)を使用
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          WORKSHEET_NAME: ${{ vars.WORKSHEET_NAME || '買取リスト' }}
+          WORKSHEET_NAME: ${{ vars.WORKSHEET_NAME }}
           DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
         run: python scraper/scrape.py
 
