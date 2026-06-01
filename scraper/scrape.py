@@ -218,7 +218,8 @@ def _scrape_loop(page, all_items, seen, seen_pages) -> None:
                 timeout=15000,
             )
         except PWTimeout:
-            log("  次ページへの遷移を確認できませんでした。終了。")
+            # 最終ページでは「次へ」を押してもページが変わらずタイムアウトする
+            log("  最終ページに到達しました。終了。")
             break
 
         if _current_page(page) in seen_pages:
