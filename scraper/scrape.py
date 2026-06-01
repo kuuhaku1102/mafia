@@ -239,16 +239,51 @@ def _current_page(page) -> str | None:
 # ---------------------------------------------------------------------------
 # Google Sheets 書き込み (毎日上書き)
 # ---------------------------------------------------------------------------
+def _load_service_account_info() -> dict:
+    """GOOGLE_SERVICE_ACCOUNT_JSON を辞書化する。
+
+    生のJSON / base64エンコードしたJSON の両方に対応する。
+    失敗時は秘密情報を含めずに原因を示して終了する。
+    """
+    import base64
+
+    raw = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
+    if not raw:
+        raise SystemExit(
+            "ERROR: GOOGLE_SERVICE_ACCOUNT_JSON が空です。Secrets に鍵JSONを登録してください。"
+        )
+
+    # base64で登録されている場合はデコードを試す
+    if not raw.startswith("{"):
+        try:
+            decoded = base64.b64decode(raw, validate=True).decode("utf-8").strip()
+            if decoded.startswith("{"):
+                raw = decoded
+        except Exception:
+            pass
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raise SystemExit(
+            "ERROR: GOOGLE_SERVICE_ACCOUNT_JSON を JSON として解釈できませんでした。\n"
+            f"  受け取った値: 長さ={len(raw)}文字 / 先頭文字={raw[:1]!r}\n"
+            "  対処: サービスアカウント鍵JSONの中身全体('{' から '}' まで)を\n"
+            "        そのまま Secret に貼り付けてください。\n"
+            "  (改行で問題が出る場合は base64 エンコードした文字列でも可)"
+        )
+
+
 def write_to_sheets(items: list[dict]) -> None:
     import gspread
     from google.oauth2.service_account import Credentials
 
-    sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
     spreadsheet_id = os.environ.get("SPREADSHEET_ID") or DEFAULT_SPREADSHEET_ID
     worksheet_name = os.environ.get("WORKSHEET_NAME") or DEFAULT_WORKSHEET_NAME
 
+    info = _load_service_account_info()
     creds = Credentials.from_service_account_info(
-        json.loads(sa_json),
+        info,
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
     gc = gspread.authorize(creds)
