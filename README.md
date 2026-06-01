@@ -7,10 +7,18 @@ GitHub Actions で実行されるため、サーバーやPCを常時起動する
 
 ## 仕組み
 
-- `scraper/scrape.py` … スクレイピング本体 (requests + BeautifulSoup)。
-  価格(円/¥)を含む繰り返し要素を自動検出して、商品名・買取価格・画像URL・詳細URL を抽出します。
+- `scraper/scrape.py` … スクレイピング本体。ページネーションが JavaScript 駆動
+  (`href="javascript:void(0)"`) のため、**Playwright** のヘッドレスブラウザで
+  「次へ」をたどって全ページを巡回し、各商品から以下を抽出します。
+  - 商品名 (`.name`)
+  - グレード (`.tag` 例: PSA10)
+  - 買取価格 (`.price` を数値化)
+  - 在庫 (`.stock` 例: 残り2点 / 受付終了)
+  - 受付状態 (募集中 / 受付終了 … `li.item.closed` から判定)
+  - 画像URL (`.card img`)
 - `.github/workflows/scrape.yml` … 毎日 01:00 UTC (= 10:00 JST) に実行する定期ジョブ。
 - 取得結果は Google スプレッドシートの指定シートを **毎回クリアして上書き** します。
+- `#itemCount`(例: 494件) を総件数として読み取り、取得漏れがあれば警告ログを出します。
 
 ## セットアップ手順
 
@@ -44,31 +52,36 @@ GitHub Actions で実行されるため、サーバーやPCを常時起動する
 **Actions** タブ →「買取リスト スクレイピング」→ **Run workflow** で手動実行できます。
 `dry_run` に `1` を指定すると、スプレッドシートへ書き込まずログにサンプルを出力します。
 
-## サイト構造に合わせた調整
-
-セレクタは自動検出されますが、うまく取得できない場合はワークフローの `env:` に
-以下を追加して明示指定できます (CSSセレクタ)。
+## 任意の調整用 環境変数
 
 | 環境変数 | 説明 |
 |----------|------|
-| `ITEM_SELECTOR` | 各商品を囲む要素 (例: `.item`) |
-| `NAME_SELECTOR` | 商品名 (item内の相対セレクタ) |
-| `PRICE_SELECTOR` | 買取価格 |
-| `IMAGE_SELECTOR` | 画像 |
-| `BASE_URL` | 取得対象URL |
-| `MAX_PAGES` | ページネーション探索上限 (既定 300) |
-| `REQUEST_DELAY` | リクエスト間隔秒 (既定 1.0) |
+| `BASE_URL` | 取得対象URL (既定: 買取リストページ) |
+| `MAX_PAGES` | ページ巡回の上限 (既定 100) |
+| `REQUEST_DELAY` | ページ遷移後の待機秒 (既定 1.0) |
+| `WORKSHEET_NAME` | 書き込み先シート名 (既定: 買取リスト) |
+| `DRY_RUN` | `1` で書き込みせず動作確認 |
 
 取得に失敗した場合、ジョブは最後に取得した HTML を `debug-page` という名前の
-**Artifact** としてアップロードします。これをダウンロードして実際の構造を確認し、
-上記セレクタを調整してください。
+**Artifact** としてアップロードします。サイトのHTML構造が変わった場合は
+これをダウンロードして確認し、`scraper/scrape.py` のセレクタを調整してください。
 
 ## ローカル実行 (任意)
 
 ```bash
 pip install -r scraper/requirements.txt
+python -m playwright install chromium
 export GOOGLE_SERVICE_ACCOUNT_JSON="$(cat service_account.json)"
 export SPREADSHEET_ID="..."
-python scraper/scrape.py          # 書き込みあり
+python scraper/scrape.py            # 書き込みあり
 DRY_RUN=1 python scraper/scrape.py  # 書き込みなし(動作確認)
+```
+
+## テスト
+
+実際のページHTMLを `scraper/tests/fixture_page.html` に保存しており、
+パーサーの抽出ロジックを検証できます。
+
+```bash
+python scraper/tests/test_parse.py
 ```

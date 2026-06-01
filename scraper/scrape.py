@@ -5,21 +5,19 @@ torecabank 買取リスト スクレイパー
 https://store.torecabank.com/kaitori_list の全データを取得し、
 Google スプレッドシートへ書き込む（毎日上書き）。
 
+ページネーションが JavaScript 駆動 (href="javascript:void(0)") のため、
+Playwright のヘッドレスブラウザで「次へ」をたどって全ページを巡回する。
+
 実行に必要な環境変数:
   GOOGLE_SERVICE_ACCOUNT_JSON  サービスアカウント鍵 (JSON文字列そのもの)
   SPREADSHEET_ID               書き込み先スプレッドシートのID
   WORKSHEET_NAME               シート(タブ)名 (省略時: "買取リスト")
 
-任意の上書き用環境変数 (サイト構造に合わせて調整する場合):
-  BASE_URL        既定: https://store.torecabank.com/kaitori_list
-  ITEM_SELECTOR   各アイテムを囲むCSSセレクタ (例: ".item")
-  NAME_SELECTOR   アイテム内の商品名セレクタ
-  PRICE_SELECTOR  アイテム内の価格セレクタ
-  IMAGE_SELECTOR  アイテム内の画像セレクタ
-  MAX_PAGES       ページネーション探索の上限 (既定: 300)
-  REQUEST_DELAY   各リクエスト間の待機秒 (既定: 1.0)
-
-セレクタ未指定の場合は、価格(円/¥)を含む繰り返し要素を自動検出する。
+任意:
+  BASE_URL       既定: https://store.torecabank.com/kaitori_list
+  MAX_PAGES      ページ巡回の上限 (既定: 100)
+  REQUEST_DELAY  ページ遷移後の待機秒 (既定: 1.0)
+  DRY_RUN=1      スプレッドシートへ書き込まずログ出力のみ
 """
 
 import json
@@ -29,40 +27,18 @@ import sys
 import time
 from urllib.parse import urljoin
 
-import requests
 from bs4 import BeautifulSoup
 
-# ---------------------------------------------------------------------------
-# 設定
-# ---------------------------------------------------------------------------
 BASE_URL = os.environ.get("BASE_URL", "https://store.torecabank.com/kaitori_list")
-MAX_PAGES = int(os.environ.get("MAX_PAGES", "300"))
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "100"))
 REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "1.0"))
 
-ITEM_SELECTOR = os.environ.get("ITEM_SELECTOR") or None
-NAME_SELECTOR = os.environ.get("NAME_SELECTOR") or None
-PRICE_SELECTOR = os.environ.get("PRICE_SELECTOR") or None
-IMAGE_SELECTOR = os.environ.get("IMAGE_SELECTOR") or None
+HEADERS = ["商品名", "グレード", "買取価格", "在庫", "受付状態", "画像URL", "取得日時"]
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-}
-
-# 価格らしき文字列の検出 (例: 1,200円 / ¥1,200 / 1200 円)
-PRICE_RE = re.compile(r"(?:¥|￥)?\s*([0-9][0-9,]*)\s*円|(?:¥|￥)\s*([0-9][0-9,]*)")
-
-# 自動検出で試す候補セレクタ (上から順に試し、最も多くヒットしたものを採用)
-CANDIDATE_ITEM_SELECTORS = [
-    ".kaitori-item", ".kaitori_item", ".kaitori-list-item",
-    ".product-item", ".product", ".item-box", ".item-card",
-    "li.item", ".item", ".card", ".goods", ".goods-item",
-    ".list-item", "article", ".grid-item", ".col .card",
-]
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 
 def log(msg: str) -> None:
@@ -70,174 +46,163 @@ def log(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# HTTP
-# ---------------------------------------------------------------------------
-def fetch(url: str, session: requests.Session) -> str | None:
-    try:
-        resp = session.get(url, headers=HEADERS, timeout=30)
-    except requests.RequestException as exc:
-        log(f"  ! リクエスト失敗 {url}: {exc}")
-        return None
-    if resp.status_code == 404:
-        return None
-    if resp.status_code != 200:
-        log(f"  ! HTTP {resp.status_code} {url}")
-        return None
-    resp.encoding = resp.apparent_encoding or resp.encoding
-    return resp.text
-
-
-# ---------------------------------------------------------------------------
 # パース
 # ---------------------------------------------------------------------------
-def find_price(text: str) -> str:
-    m = PRICE_RE.search(text or "")
-    if not m:
+def clean_url(url: str) -> str:
+    """scheme以降の重複スラッシュを正規化 (例: com//uploads -> com/uploads)。"""
+    url = (url or "").strip()
+    if not url:
         return ""
-    num = m.group(1) or m.group(2) or ""
-    return num.replace(",", "")
+    url = urljoin(BASE_URL, url)
+    return re.sub(r"(?<!:)//+", "/", url)
 
 
-def detect_item_selector(soup: BeautifulSoup) -> str | None:
-    """価格を含む繰り返し要素から最適なセレクタを推定する。"""
-    best_sel, best_count = None, 0
-    for sel in CANDIDATE_ITEM_SELECTORS:
-        nodes = soup.select(sel)
-        if len(nodes) < 2:
-            continue
-        priced = sum(1 for n in nodes if find_price(n.get_text(" ", strip=True)))
-        # 半分以上が価格を含むものを「アイテムらしい」とみなす
-        if priced >= max(2, len(nodes) // 2) and priced > best_count:
-            best_sel, best_count = sel, priced
-    return best_sel
+def parse_price(text: str) -> str:
+    digits = re.sub(r"[^0-9]", "", text or "")
+    return digits
 
 
-def text_of(node, selector: str | None) -> str:
-    if selector:
-        el = node.select_one(selector)
-        return el.get_text(" ", strip=True) if el else ""
-    return ""
+def _text(node, selector: str) -> str:
+    el = node.select_one(selector)
+    return el.get_text(" ", strip=True) if el else ""
 
 
-def extract_name(node) -> str:
-    if NAME_SELECTOR:
-        return text_of(node, NAME_SELECTOR)
-    # 画像のalt属性 → 最長のテキスト行 の順で名前らしきものを推定
-    img = node.find("img")
-    if img and img.get("alt"):
-        alt = img.get("alt").strip()
-        if alt:
-            return alt
-    candidates = [
-        t.strip()
-        for t in node.stripped_strings
-        if t.strip() and not find_price(t)
-    ]
-    return max(candidates, key=len) if candidates else ""
+def parse_items(html: str) -> list[dict]:
+    """1ページ分のHTMLから商品リストを抽出する。
 
-
-def extract_price(node) -> str:
-    if PRICE_SELECTOR:
-        return find_price(text_of(node, PRICE_SELECTOR))
-    return find_price(node.get_text(" ", strip=True))
-
-
-def extract_image(node) -> str:
-    el = node.select_one(IMAGE_SELECTOR) if IMAGE_SELECTOR else node.find("img")
-    if not el:
-        return ""
-    for attr in ("src", "data-src", "data-original", "data-lazy-src"):
-        if el.get(attr):
-            return urljoin(BASE_URL, el.get(attr))
-    return ""
-
-
-def extract_url(node) -> str:
-    a = node.find("a", href=True)
-    return urljoin(BASE_URL, a["href"]) if a else ""
-
-
-def parse_page(html: str, selector: str | None) -> tuple[list[dict], str | None]:
+    画像付きの #cardList を優先し、無ければ #listView を使う。
+    """
     soup = BeautifulSoup(html, "lxml")
-    if selector is None:
-        selector = detect_item_selector(soup)
-        if selector:
-            log(f"  自動検出セレクタ: '{selector}'")
-    if not selector:
-        return [], None
+    container = soup.select_one("#cardList") or soup.select_one("#listView")
+    if container is None:
+        return []
 
     items = []
-    for node in soup.select(selector):
-        price = extract_price(node)
-        name = extract_name(node)
+    for li in container.select("li.item"):
+        name = _text(li, ".name")
+        price = parse_price(_text(li, ".price"))
         if not name and not price:
             continue
+
+        stock = _text(li, ".stock")
+        classes = li.get("class", [])
+        is_closed = "closed" in classes or "受付終了" in stock
+        img = li.select_one(".card img")
+        image = clean_url(img.get("src")) if img and img.get("src") else ""
+
         items.append(
             {
                 "商品名": name,
+                "グレード": _text(li, ".tag"),
                 "買取価格": price,
-                "画像URL": extract_image(node),
-                "詳細URL": extract_url(node),
+                "在庫": stock,
+                "受付状態": "受付終了" if is_closed else "募集中",
+                "画像URL": image,
             }
         )
-    return items, selector
+    return items
+
+
+def expected_count(html: str) -> int | None:
+    """#itemCount の "494件表示" から総件数を取得 (サニティチェック用)。"""
+    soup = BeautifulSoup(html, "lxml")
+    el = soup.select_one("#itemCount")
+    if not el:
+        return None
+    digits = re.sub(r"[^0-9]", "", el.get_text())
+    return int(digits) if digits else None
 
 
 # ---------------------------------------------------------------------------
-# ページネーション
+# Playwright で全ページ巡回
 # ---------------------------------------------------------------------------
-def page_url(base: str, page: int) -> str:
-    if page == 1:
-        return base
-    sep = "&" if "?" in base else "?"
-    return f"{base}{sep}page={page}"
-
-
 def scrape_all() -> list[dict]:
-    session = requests.Session()
+    from playwright.sync_api import TimeoutError as PWTimeout
+    from playwright.sync_api import sync_playwright
+
     all_items: list[dict] = []
     seen = set()
-    selector = ITEM_SELECTOR
-    last_dump = None
+    seen_pages: set[str] = set()
+    last_html = None
 
-    for page in range(1, MAX_PAGES + 1):
-        url = page_url(BASE_URL, page)
-        log(f"[page {page}] {url}")
-        html = fetch(url, session)
-        if html is None:
-            log("  ページ取得できず。終了。")
-            break
-        last_dump = html
+    with sync_playwright() as p:
+        browser = p.chromium.launch(args=["--no-sandbox"])
+        page = browser.new_page(user_agent=USER_AGENT, locale="ja-JP")
+        log(f"アクセス: {BASE_URL}")
+        page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
 
-        items, selector = parse_page(html, selector)
-        if not items:
-            log("  アイテム0件。最終ページとみなして終了。")
-            break
+        # 商品リストの描画を待つ
+        try:
+            page.wait_for_selector("#cardList li.item, #listView li.item", timeout=30000)
+        except PWTimeout:
+            log("! 商品リストが表示されませんでした。")
 
-        # 重複(同一URL/名前)で次ページが無いケースを検知して停止
-        new_items = []
-        for it in items:
-            key = it["詳細URL"] or (it["商品名"], it["買取価格"])
-            if key in seen:
-                continue
-            seen.add(key)
-            new_items.append(it)
+        total = expected_count(page.content())
+        if total:
+            log(f"総件数(itemCount): {total} 件")
 
-        if not new_items:
-            log("  新規アイテムなし(同一ページの繰り返し)。終了。")
-            break
+        for n in range(1, MAX_PAGES + 1):
+            cur = _current_page(page)
+            html = page.content()
+            last_html = html
 
-        all_items.extend(new_items)
-        log(f"  取得 {len(new_items)} 件 (累計 {len(all_items)} 件)")
-        time.sleep(REQUEST_DELAY)
+            page_items = parse_items(html)
+            new_items = []
+            for it in page_items:
+                key = (it["商品名"], it["グレード"], it["買取価格"], it["画像URL"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                new_items.append(it)
+            all_items.extend(new_items)
+            log(f"[page {cur or n}] {len(page_items)} 件 (新規 {len(new_items)}, 累計 {len(all_items)})")
 
-    # デバッグ用: 取得できなかった場合は最後のHTMLを保存
-    if not all_items and last_dump:
+            seen_pages.add(cur or str(n))
+
+            # 「次へ」ボタンの状態を確認
+            next_btn = page.query_selector(".pagination .pager.next")
+            if not next_btn:
+                break
+            cls = next_btn.get_attribute("class") or ""
+            if "disabled" in cls:
+                break
+
+            next_btn.click()
+            # 現在ページ番号が変わるまで待機
+            try:
+                page.wait_for_function(
+                    """(prev) => {
+                        const el = document.querySelector('.pagination .page.current');
+                        return el && el.innerText.trim() !== prev;
+                    }""",
+                    arg=(cur or ""),
+                    timeout=15000,
+                )
+            except PWTimeout:
+                log("  次ページへの遷移を確認できませんでした。終了。")
+                break
+
+            if _current_page(page) in seen_pages:
+                log("  既知のページに戻りました。終了。")
+                break
+            time.sleep(REQUEST_DELAY)
+
+        browser.close()
+
+    if not all_items and last_html:
         with open("debug_page.html", "w", encoding="utf-8") as f:
-            f.write(last_dump)
-        log("! アイテムを抽出できませんでした。debug_page.html を保存しました。")
+            f.write(last_html)
+        log("! 抽出0件。debug_page.html を保存しました。")
+
+    if total and len(all_items) < total:
+        log(f"! 注意: 取得 {len(all_items)} 件 < 総件数 {total} 件。巡回漏れの可能性。")
 
     return all_items
+
+
+def _current_page(page) -> str | None:
+    el = page.query_selector(".pagination .page.current")
+    return el.inner_text().strip() if el else None
 
 
 # ---------------------------------------------------------------------------
@@ -261,18 +226,19 @@ def write_to_sheets(items: list[dict]) -> None:
     try:
         ws = sh.worksheet(worksheet_name)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=worksheet_name, rows=100, cols=10)
+        ws = sh.add_worksheet(title=worksheet_name, rows=100, cols=len(HEADERS))
 
-    headers = ["商品名", "買取価格", "画像URL", "詳細URL", "取得日時"]
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    rows = [headers]
+    rows = [HEADERS]
     for it in items:
         rows.append(
             [
                 it["商品名"],
+                it["グレード"],
                 it["買取価格"],
+                it["在庫"],
+                it["受付状態"],
                 it["画像URL"],
-                it["詳細URL"],
                 timestamp,
             ]
         )
@@ -291,13 +257,13 @@ def main() -> int:
     log(f"=== 取得合計: {len(items)} 件 ===")
 
     if not items:
-        log("ERROR: データを取得できませんでした。セレクタの調整が必要です。")
+        log("ERROR: データを取得できませんでした。")
         return 1
 
     if os.environ.get("DRY_RUN") == "1":
-        log("DRY_RUN=1 のためスプレッドシートへの書き込みはスキップします。")
+        log("DRY_RUN=1 のため書き込みはスキップします。サンプル:")
         for it in items[:5]:
-            log(f"  例: {it}")
+            log(f"  {it}")
         return 0
 
     write_to_sheets(items)
