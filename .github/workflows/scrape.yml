@@ -2,8 +2,8 @@ name: 買取リスト スクレイピング
 
 on:
   schedule:
-    # 毎日 10:00 JST = 01:00 UTC
-    - cron: "0 1 * * *"
+    # 毎日 10:00, 13:00, 15:00, 18:00 JST = 01:00, 04:00, 06:00, 09:00 UTC
+    - cron: "0 1,4,6,9 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
