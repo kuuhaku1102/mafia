@@ -75,6 +75,9 @@ jobs:
           PKC_PROBE_URL: ${{ github.event.inputs.probe_url }}
           PKC_CARD_QUERY: ${{ github.event.inputs.card_query }}
           PKC_WATCHLIST_WORKSHEET: ${{ vars.PKC_WATCHLIST_WORKSHEET }}
+          PKC_STATUS_WORKSHEET: ${{ vars.PKC_STATUS_WORKSHEET }}
+          # ウォッチリストが空のとき全カードを巡回してよいか (既定: しない)
+          PKC_CRAWL_ALL: ${{ vars.PKC_CRAWL_ALL }}
           PKC_SINCE: ${{ github.event.inputs.since }}
           PKC_MAX_ITEMS: ${{ github.event.inputs.max_items || '0' }}
           PKC_INDEX_WORKSHEET: ${{ vars.PKC_INDEX_WORKSHEET }}

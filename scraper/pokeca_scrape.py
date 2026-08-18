@@ -164,8 +164,11 @@ CARD_WS = os.environ.get("PKC_CARD_WORKSHEET") or "pkc_card_history"
 MASTER_WS = os.environ.get("PKC_MASTER_WORKSHEET") or "pkc_card_master"
 TREND_WS = os.environ.get("PKC_TREND_WORKSHEET") or "pkc_trend"
 WATCHLIST_WS = os.environ.get("PKC_WATCHLIST_WORKSHEET") or "pkc_watchlist"
+STATUS_WS = os.environ.get("PKC_STATUS_WORKSHEET") or "pkc_card_status"
 # card モードで調べたい銘柄 (品番 / 名前 / card_id / URL のいずれか)
 CARD_QUERY = (os.environ.get("PKC_CARD_QUERY") or "").strip()
+# ウォッチリストが空のとき、全カードを巡回してよいか (既定: しない)
+CRAWL_ALL = os.environ.get("PKC_CRAWL_ALL") == "1"
 # 直近何日ぶんを card モードの明細表に出すか
 SHOW_DAYS = int(os.environ.get("PKC_SHOW_DAYS") or "20")
 
@@ -178,6 +181,15 @@ MASTER_HEADERS = ["card_id", "card_name", "hinban", "url", "last_seen_at"]
 # ★対象カードの指定用。品番と名前を手入力すれば、そのカードだけを巡回する。
 # 5秒間隔・1日1回では全カードを回りきれないので、実運用ではこれで絞る。
 WATCHLIST_HEADERS = ["品番", "名前", "card_id", "url", "メモ"]
+# ★対象カードの現況ボード。毎朝これを見て買取価格を決める想定。
+# 履歴は pkc_card_history / pkc_trend が持つので、こちらは
+# 「1銘柄1行の最新状態」を上書き更新する view として扱う (行は増やさない)。
+STATUS_HEADERS = [
+    "品番", "名前", "状態", "傾向", "買取調整%",
+    "最新価格", "最新日", "最新が補完",
+    "d1%", "d3%", "ma5", "ma20", "連続日数", "変動%",
+    "有効観測日", "記録日数", "判定根拠", "直近推移", "card_id", "更新日時",
+]
 TREND_HEADERS = [
     "date", "scope", "key", "label", "d1", "d3", "ma5", "ma20", "streak", "vol20",
     "valid_days", "trend", "suggested_buffer_pct", "imputation_basis", "fetched_at",
@@ -188,6 +200,8 @@ INDEX_KEY_FIELDS = ["date", "index_type"]
 CARD_KEY_FIELDS = ["date", "card_id", "condition"]
 MASTER_KEY_FIELDS = ["card_id"]
 WATCHLIST_KEY_FIELDS = ["品番", "名前"]
+# 1銘柄(card_id)×状態(condition) で1行。日付をキーに含めないので行が増えない。
+STATUS_KEY_FIELDS = ["card_id", "状態"]
 TREND_KEY_FIELDS = ["date", "scope", "key"]
 
 # --- 傾向判定の閾値 -------------------------------------------------------
@@ -960,6 +974,92 @@ def report_card(card_rows: list[dict], query: str, show_days: int = 20) -> int:
 
 
 # ===========================================================================
+# 現況ボード (対象カードの最新状態をシートへ転記する)
+# ---------------------------------------------------------------------------
+# ログだけだと毎朝見るのに不便なので、1銘柄1行の表としてシートに出す。
+# 履歴は pkc_card_history / pkc_trend が持っているので、
+# こちらは「最新状態の view」として上書き更新する (行は増やさない)。
+# ===========================================================================
+def price_trail(marked: list[dict], n: int = 8) -> str:
+    """直近の価格推移を1セルに収める ("139000→137800*→136000")。
+
+    末尾に * が付いている日は補完 (取引が無く前日価格を引き継いだ日)。
+    セル1つで「本当に動いていないのか、誰も取引していないだけか」が見える。
+    """
+    parts = []
+    for r in (marked or [])[-n:]:
+        v = r.get("price")
+        if v is None:
+            continue
+        parts.append(f"{int(v)}{'*' if r.get('imputed_suspect') else ''}")
+    return "→".join(parts)
+
+
+def build_status_row(card: dict, condition: str, series: list[dict]) -> dict:
+    """1銘柄×1状態 の現況行を作る。"""
+    m = compute_metrics(series)
+    trend = classify_trend(m)
+    marked, basis = mark_imputed(series)
+    latest = marked[-1] if marked else {}
+    return {
+        "品番": card.get("hinban", ""),
+        "名前": card.get("card_name", ""),
+        "状態": condition or "不明",
+        "傾向": trend,
+        "買取調整%": suggested_buffer_pct(m, trend),
+        "最新価格": latest.get("price", ""),
+        "最新日": latest.get("date", ""),
+        # 最新日が補完だと、その価格は実測ではない。必ず見えるようにする。
+        "最新が補完": "★補完" if latest.get("imputed_suspect") else "",
+        "d1%": _fmt(m["d1"]),
+        "d3%": _fmt(m["d3"]),
+        "ma5": _fmt(m["ma5"], 1),
+        "ma20": _fmt(m["ma20"], 1),
+        "連続日数": m["streak"],
+        "変動%": _fmt(m["vol20"]),
+        "有効観測日": m["valid_days"],
+        "記録日数": len(marked),
+        "判定根拠": basis,
+        "直近推移": price_trail(marked),
+        "card_id": card.get("card_id", ""),
+        "更新日時": timestamp_jst(),
+    }
+
+
+def build_status_rows(card_rows: list[dict], only_ids: set | None = None) -> list[dict]:
+    """履歴から現況ボードの行を組み立てる。
+
+    only_ids を渡すと、その card_id だけに絞る (品番を入れた銘柄だけを載せる)。
+    """
+    by_key: dict[tuple, list[dict]] = {}
+    info: dict[str, dict] = {}
+    for r in card_rows or []:
+        cid = r.get("card_id", "")
+        if not cid or (only_ids is not None and cid not in only_ids):
+            continue
+        by_key.setdefault((cid, r.get("condition", "")), []).append(r)
+        # 名前・品番は後の行ほど新しいので上書きしていく
+        if r.get("card_name") or r.get("hinban"):
+            info[cid] = {
+                "card_id": cid,
+                "card_name": r.get("card_name") or info.get(cid, {}).get("card_name", ""),
+                "hinban": r.get("hinban") or info.get(cid, {}).get("hinban", ""),
+            }
+
+    rows = []
+    for (cid, cond), rs in by_key.items():
+        series = _to_series(rs)
+        if not series:
+            continue
+        rows.append(build_status_row(info.get(cid, {"card_id": cid}), cond, series))
+
+    # 下落を上に、次に判定不可 (注意が要る順)。シート上でも目に付きやすくする。
+    order = {"下落": 0, "判定不可": 1, "横ばい": 2, "上昇": 3}
+    rows.sort(key=lambda r: (order.get(r["傾向"], 9), r.get("品番") or "", r.get("状態") or ""))
+    return rows
+
+
+# ===========================================================================
 # upsert (追記型。ws.clear() は使わない)
 # ===========================================================================
 def record_key(record: dict, key_fields: list[str]) -> tuple:
@@ -1714,6 +1814,22 @@ def main() -> int:
         log(f"=== 銘柄照会: '{CARD_QUERY}' (履歴 {len(card_rows)}行から検索) ===")
         if report_card(card_rows, CARD_QUERY, SHOW_DAYS) == 0:
             return 1
+
+        # ログだけでなくシートにも転記する
+        cards = []
+        seen = set()
+        for r in card_rows:
+            cid = r.get("card_id", "")
+            if cid and cid not in seen:
+                seen.add(cid)
+                cards.append({"card_id": cid, "card_name": r.get("card_name", ""),
+                              "hinban": r.get("hinban", "")})
+        hit_ids = {c["card_id"] for c in match_cards(CARD_QUERY, cards)[:5]}
+        status = build_status_rows(card_rows, only_ids=hit_ids)
+        if status:
+            log("")
+            log(f"--- 現況ボードへ転記: {len(status)}行 ---")
+            upsert_to_sheet(sh, STATUS_WS, STATUS_HEADERS, status, STATUS_KEY_FIELDS, dry_run)
         log("")
         log("=== 完了 ===")
         return 0
@@ -1791,8 +1907,9 @@ def main() -> int:
                     for r in read_history(sh, MASTER_WS, MASTER_HEADERS)
                 ]
 
-                # ★ウォッチリストがあれば、そこに載っている銘柄だけを巡回する。
-                # 5秒間隔・1日1回では全カードは回りきれないので、実運用では必須。
+                # ★品番を入れた銘柄だけを巡回する。
+                # 1件あたり REQUEST_DELAY 秒待つため全カード巡回は現実的に終わらず、
+                # 相手先(個人運営の無料ファンサイト)への負荷も過大になる。
                 watch = load_watchlist(sh)
                 if watch:
                     watch = resolve_watchlist(sh, watch, all_cards)
@@ -1812,11 +1929,25 @@ def main() -> int:
                                 "url": w["url"],
                             })
                     log(f"  ウォッチリスト {len(watch)}件 -> 巡回対象 {len(cards)}件")
-                else:
+                    unresolved = [w for w in watch if not w.get("card_id") and not w.get("url")]
+                    if unresolved:
+                        log(f"  ! {len(unresolved)}件は照合できず巡回対象から外れています。")
+                        for w in unresolved[:10]:
+                            log(f"      {w.get('品番','')} {w.get('名前','')}")
+                        log(f"    {WATCHLIST_WS} の card_id / url を手で埋めてください。")
+                elif CRAWL_ALL:
                     cards = all_cards
-                    log(f"  ウォッチリスト未設定のため全 {len(cards)}件が対象です。")
+                    log(f"  PKC_CRAWL_ALL=1 のため全 {len(cards)}件が対象です。")
                     log(f"  ! 1件あたり{REQUEST_DELAY}秒待つため、件数が多いと時間内に終わりません。")
-                    log(f"  ! {WATCHLIST_WS} シートに品番と名前を入れて対象を絞ることを推奨します。")
+                else:
+                    # ★空のまま全件クロールに落とさない。相手先への負荷が大きすぎる。
+                    log(f"! {WATCHLIST_WS} シートが空です。カード別価格の取得をスキップします。")
+                    log(f"  巡回したい銘柄の品番を {WATCHLIST_WS} に入力してください。")
+                    log("  (名前は任意。品番だけで照合できます)")
+                    log("  全カードを巡回したい場合のみ PKC_CRAWL_ALL=1 を指定してください。")
+                    if not dry_run:
+                        _get_or_create(sh, WATCHLIST_WS, WATCHLIST_HEADERS)
+                    cards = []
 
                 cards = [c for c in cards if c.get("url")]
                 if MAX_ITEMS > 0:
@@ -1844,6 +1975,16 @@ def main() -> int:
         upsert_to_sheet(sh, MASTER_WS, MASTER_HEADERS, master_records, MASTER_KEY_FIELDS, dry_run)
     if card_records:
         upsert_to_sheet(sh, CARD_WS, CARD_HEADERS, card_records, CARD_KEY_FIELDS, dry_run)
+
+    # --- 対象カードの現況ボードをシートへ転記する ---
+    if MODE in ("cards", "daily", "backfill"):
+        history = read_history(sh, CARD_WS, CARD_HEADERS) if not dry_run else card_records
+        watch_ids = {w.get("card_id") for w in load_watchlist(sh) if w.get("card_id")}
+        # 品番を入れた銘柄だけを載せる (ウォッチリストが空なら履歴にあるもの全部)
+        status = build_status_rows(history, only_ids=watch_ids or None)
+        if status:
+            log(f"--- 現況ボードの更新: {len(status)}行 ---")
+            upsert_to_sheet(sh, STATUS_WS, STATUS_HEADERS, status, STATUS_KEY_FIELDS, dry_run)
 
     # --- daily は最後に傾向を再計算する (これが出力の本体) ---
     if MODE in ("daily", "backfill"):

@@ -406,6 +406,119 @@ def test_trend_row_has_readable_label():
     assert "label" not in pkc.TREND_KEY_FIELDS
 
 
+# ---------------------------------------------------------------------------
+# 現況ボード (対象カードの最新状態をシートへ転記する)
+# ---------------------------------------------------------------------------
+def _hist(cid, name, hinban, cond, prices, counts):
+    return [
+        {"date": f"2026-08-{i + 1:02d}", "card_id": cid, "card_name": name,
+         "hinban": hinban, "condition": cond, "price": str(p), "trade_count": str(c)}
+        for i, (p, c) in enumerate(zip(prices, counts))
+    ]
+
+
+def test_price_trail_marks_imputed():
+    """直近推移のセルで、補完日に * が付く。"""
+    marked, _ = pkc.mark_imputed([
+        {"date": "2026-08-01", "price": 100, "trade_count": 2},
+        {"date": "2026-08-02", "price": 100, "trade_count": 0},   # 補完
+        {"date": "2026-08-03", "price": 98, "trade_count": 1},
+    ])
+    assert pkc.price_trail(marked) == "100→100*→98"
+    assert pkc.price_trail([]) == ""
+
+
+def test_build_status_rows():
+    """1銘柄1行の現況行が作られる。"""
+    rows = _hist("riza-006", "リザードンex", "006/165", "美品",
+                 [200 - i * 3 for i in range(20)], [2] * 20)
+    status = pkc.build_status_rows(rows)
+    assert len(status) == 1
+    r = status[0]
+    for h in pkc.STATUS_HEADERS:
+        assert h in r, h
+    assert r["品番"] == "006/165"
+    assert r["名前"] == "リザードンex"
+    assert r["状態"] == "美品"
+    assert r["傾向"] == "下落"
+    assert r["card_id"] == "riza-006"
+    assert float(r["買取調整%"]) > 0
+    assert r["有効観測日"] == 20
+    assert "→" in r["直近推移"]
+
+
+def test_status_flags_imputed_latest():
+    """最新日が補完だった場合に、その価格が実測でないことが見える。"""
+    rows = _hist("x", "テスト", "001/100", "美品",
+                 [100 - i for i in range(19)] + [82], [2] * 19 + [0])
+    r = pkc.build_status_rows(rows)[0]
+    assert r["最新が補完"] == "★補完"
+    assert r["直近推移"].endswith("*")
+
+
+def test_status_only_watchlisted_cards():
+    """★品番を入れた銘柄だけをボードに載せる。"""
+    rows = (
+        _hist("a", "カードA", "001/100", "美品", [100 - i for i in range(20)], [2] * 20)
+        + _hist("b", "カードB", "002/100", "美品", [100 - i for i in range(20)], [2] * 20)
+    )
+    both = pkc.build_status_rows(rows)
+    assert {r["card_id"] for r in both} == {"a", "b"}
+
+    only_a = pkc.build_status_rows(rows, only_ids={"a"})
+    assert {r["card_id"] for r in only_a} == {"a"}
+    assert pkc.build_status_rows(rows, only_ids=set()) == []
+
+
+def test_status_sorted_by_urgency():
+    """注意が要る順 (下落 → 判定不可 → 横ばい → 上昇) に並ぶ。"""
+    rows = (
+        _hist("up", "上昇", "003/100", "美品", [100 + i * 3 for i in range(20)], [2] * 20)
+        + _hist("down", "下落", "001/100", "美品", [200 - i * 3 for i in range(20)], [2] * 20)
+        + _hist("few", "判定不可", "002/100", "美品", [100, 99, 98], [2] * 3)
+    )
+    status = pkc.build_status_rows(rows)
+    assert [r["傾向"] for r in status][:2] == ["下落", "判定不可"], [r["傾向"] for r in status]
+
+
+def test_status_upsert_does_not_grow_rows():
+    """★現況ボードは行が増えない (1銘柄1行を上書き更新する view)。
+
+    日付をキーに含めないので、毎日走らせても行数は一定。
+    履歴は pkc_card_history / pkc_trend 側が持つ。
+    """
+    rows = _hist("a", "カードA", "001/100", "美品",
+                 [100 - i for i in range(20)], [2] * 20)
+    day1 = pkc.build_status_rows(rows)
+    header, appends, _, stats = pkc.plan_upsert(
+        [], day1, pkc.STATUS_HEADERS, pkc.STATUS_KEY_FIELDS)
+    assert stats["appended"] == 1
+
+    grid = [header] + appends
+    # 翌日: 価格が1日ぶん増えても行は増えず、既存行が更新される
+    rows2 = rows + _hist("a", "カードA", "001/100", "美品", [79], [3])
+    rows2[-1]["date"] = "2026-08-21"
+    day2 = pkc.build_status_rows(rows2)
+    _, appends2, updates2, stats2 = pkc.plan_upsert(
+        grid, day2, pkc.STATUS_HEADERS, pkc.STATUS_KEY_FIELDS)
+    assert stats2["appended"] == 0, stats2
+    assert stats2["updated"] == 1, stats2
+
+
+def test_status_separates_conditions():
+    """同じカードでも状態(美品/PSA10)ごとに別行になる。"""
+    rows = (
+        _hist("a", "カードA", "001/100", "美品", [100 - i for i in range(20)], [2] * 20)
+        + _hist("a", "カードA", "001/100", "PSA10", [500 - i for i in range(20)], [2] * 20)
+    )
+    status = pkc.build_status_rows(rows)
+    assert len(status) == 2
+    assert {r["状態"] for r in status} == {"美品", "PSA10"}
+    # キーが状態を含むので互いを上書きしない
+    keys = {pkc.record_key(r, pkc.STATUS_KEY_FIELDS) for r in status}
+    assert len(keys) == 2
+
+
 def test_request_delay_floor():
     """★相手先への配慮: リクエスト間隔は下限未満に下げられない。"""
     assert pkc.REQUEST_DELAY >= pkc.MIN_REQUEST_DELAY
