@@ -203,18 +203,56 @@ def _series(prices, trade_count=3, start_day=1):
 
 
 def test_trend_undecidable_when_few_valid_days():
-    """有効観測日が10日未満の銘柄は判定不可 (無理に判定しない)。"""
+    """有効観測日が MIN_VALID_DAYS 未満の銘柄は判定不可 (無理に判定しない)。"""
     m = pkc.compute_metrics(_series([100, 99, 98, 97, 96]))
     assert m["valid_days"] == 5
     assert pkc.classify_trend(m) == "判定不可"
 
-    # 20日ぶんあっても、取引があったのが9日だけなら判定不可
+    # 20日ぶんあっても、取引があったのが数日だけなら判定不可
     rows = _series([100 - i for i in range(20)])
-    for r in rows[9:]:
+    for r in rows[pkc.MIN_VALID_DAYS - 1:]:
         r["trade_count"] = 0
     m2 = pkc.compute_metrics(rows)
-    assert m2["valid_days"] == 9
+    assert m2["valid_days"] == pkc.MIN_VALID_DAYS - 1
     assert pkc.classify_trend(m2) == "判定不可"
+
+
+def test_one_week_is_enough_to_judge():
+    """★直近1週間ぶんの実測があれば方向を判定できる。
+
+    用途が「2〜3日先にどちらへ動くか」なので、判定開始を1週間にしてある。
+    """
+    assert pkc.MIN_VALID_DAYS == 7
+
+    # 有効観測7日ちょうどの下落系列
+    m = pkc.compute_metrics(_series([200 - i * 3 for i in range(7)]))
+    assert m["valid_days"] == 7
+    assert pkc.classify_trend(m) == "下落", m
+    # 7日ちょうどでも d7 が出ること (7観測ぶんの幅として計算する)
+    assert m["d7"] is not None and m["d7"] < 0
+    assert float(pkc.suggested_buffer_pct(m, "下落")) > 0
+
+    # 6日では判定不可のまま
+    m6 = pkc.compute_metrics(_series([200 - i * 3 for i in range(6)]))
+    assert m6["valid_days"] == 6
+    assert pkc.classify_trend(m6) == "判定不可"
+    assert m6["d7"] is None
+
+
+def test_d7_uses_valid_observations_only():
+    """d7 は「有効観測7日ぶん」の幅。補完日は数に入れない。
+
+    薄い銘柄では実時間で2週間以上をまたぐことがある (それが正しい)。
+    """
+    # 14日ぶんあるが、取引があったのは1日おきの7日だけ
+    rows = _series([100 - i for i in range(14)])
+    for i, r in enumerate(rows):
+        if i % 2 == 1:
+            r["trade_count"] = 0
+    m = pkc.compute_metrics(rows)
+    assert m["valid_days"] == 7
+    # 有効な7点は 100, 98, 96, 94, 92, 90, 88 -> (88/100 - 1) * 100
+    assert abs(m["d7"] - (-12.0)) < 0.01, m["d7"]
 
 
 def test_trend_down():
@@ -428,6 +466,28 @@ def test_price_trail_marks_imputed():
     assert pkc.price_trail([]) == ""
 
 
+def test_price_trail_is_one_week():
+    """直近推移は1週間ぶん (7観測) を1セルに収める。"""
+    marked, _ = pkc.mark_imputed([
+        {"date": f"2026-08-{i + 1:02d}", "price": 100 - i, "trade_count": 2}
+        for i in range(20)
+    ])
+    trail = pkc.price_trail(marked)
+    assert len(trail.split("→")) == 7, trail
+    assert trail.endswith("81")  # 最新が末尾
+
+
+def test_status_has_d7_column():
+    """現況ボードに1週間の変化率が載る。"""
+    rows = _hist("a", "カードA", "001/100", "美品",
+                 [200 - i * 3 for i in range(20)], [2] * 20)
+    r = pkc.build_status_rows(rows)[0]
+    assert "d7%" in pkc.STATUS_HEADERS
+    assert "直近1週間" in pkc.STATUS_HEADERS
+    assert float(r["d7%"]) < 0
+    assert "d7" in pkc.TREND_HEADERS
+
+
 def test_build_status_rows():
     """1銘柄1行の現況行が作られる。"""
     rows = _hist("riza-006", "リザードンex", "006/165", "美品",
@@ -444,7 +504,7 @@ def test_build_status_rows():
     assert r["card_id"] == "riza-006"
     assert float(r["買取調整%"]) > 0
     assert r["有効観測日"] == 20
-    assert "→" in r["直近推移"]
+    assert "→" in r["直近1週間"]
 
 
 def test_status_flags_imputed_latest():
@@ -453,7 +513,7 @@ def test_status_flags_imputed_latest():
                  [100 - i for i in range(19)] + [82], [2] * 19 + [0])
     r = pkc.build_status_rows(rows)[0]
     assert r["最新が補完"] == "★補完"
-    assert r["直近推移"].endswith("*")
+    assert r["直近1週間"].endswith("*")
 
 
 def test_status_only_watchlisted_cards():

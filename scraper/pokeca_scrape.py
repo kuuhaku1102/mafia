@@ -187,11 +187,11 @@ WATCHLIST_HEADERS = ["品番", "名前", "card_id", "url", "メモ"]
 STATUS_HEADERS = [
     "品番", "名前", "状態", "傾向", "買取調整%",
     "最新価格", "最新日", "最新が補完",
-    "d1%", "d3%", "ma5", "ma20", "連続日数", "変動%",
-    "有効観測日", "記録日数", "判定根拠", "直近推移", "card_id", "更新日時",
+    "d1%", "d3%", "d7%", "ma5", "ma20", "連続日数", "変動%",
+    "有効観測日", "記録日数", "判定根拠", "直近1週間", "card_id", "更新日時",
 ]
 TREND_HEADERS = [
-    "date", "scope", "key", "label", "d1", "d3", "ma5", "ma20", "streak", "vol20",
+    "date", "scope", "key", "label", "d1", "d3", "d7", "ma5", "ma20", "streak", "vol20",
     "valid_days", "trend", "suggested_buffer_pct", "imputation_basis", "fetched_at",
 ]
 
@@ -216,7 +216,12 @@ DOWN_D3 = float(os.environ.get("PKC_DOWN_D3") or "-0.8")     # 依頼書の -1.0
 DOWN_STREAK = int(os.environ.get("PKC_DOWN_STREAK") or "-2")
 UP_D3 = float(os.environ.get("PKC_UP_D3") or "1.5")          # 依頼書の +1.0 より厳しい
 UP_STREAK = int(os.environ.get("PKC_UP_STREAK") or "3")      # 依頼書の +2 より厳しい
-MIN_VALID_DAYS = int(os.environ.get("PKC_MIN_VALID_DAYS") or "10")
+# ★直近1週間ぶんの実測があれば方向は読める。
+# 用途が「2〜3日先にどちらへ動くか」なので、10日待たせるのは過剰だった。
+# ただし7日だと ma5 と ma20 の重なりが大きく、移動平均の比較は弱くなる
+# (7日しか無ければ ma20 は7日の平均になり、うち5日が ma5 と共通)。
+# その分は d3 / d7 / streak が補う。信頼度は valid_days 列で見ること。
+MIN_VALID_DAYS = int(os.environ.get("PKC_MIN_VALID_DAYS") or "7")
 BUFFER_MULTIPLIER = float(os.environ.get("PKC_BUFFER_MULTIPLIER") or "2.0")
 
 # --- User-Agent ------------------------------------------------------------
@@ -612,7 +617,7 @@ def compute_metrics(series: list[dict]) -> dict:
     prices = [float(r["price"]) for r in valid]
 
     out = {
-        "d1": None, "d3": None, "ma5": None, "ma20": None,
+        "d1": None, "d3": None, "d7": None, "ma5": None, "ma20": None,
         "streak": 0, "vol20": None,
         "valid_days": len(valid),
         "imputation_basis": basis,
@@ -630,6 +635,10 @@ def compute_metrics(series: list[dict]) -> dict:
     out["d1"] = changes[-1] if changes else None
     if len(prices) >= 4:
         out["d3"] = _pct_change(prices[-1], prices[-4])
+    # d7 = 直近7観測ぶんの変化率 (カレンダー7日ではなく「有効観測7日」の幅)。
+    # 補完日を除いているので、薄い銘柄では実時間で2週間以上になることがある。
+    if len(prices) >= 7:
+        out["d7"] = _pct_change(prices[-1], prices[-7])
 
     if len(prices) >= 5:
         out["ma5"] = sum(prices[-5:]) / 5.0
@@ -729,6 +738,7 @@ def build_trend_row(scope: str, key: str, series: list[dict], date: str = "",
         "label": label or key,
         "d1": _fmt(m["d1"]),
         "d3": _fmt(m["d3"]),
+        "d7": _fmt(m["d7"]),
         "ma5": _fmt(m["ma5"], 1),
         "ma20": _fmt(m["ma20"], 1),
         "streak": str(m["streak"]),
@@ -950,6 +960,7 @@ def report_card(card_rows: list[dict], query: str, show_days: int = 20) -> int:
                 + ("  ※この日は取引なし（補完値）" if latest.get("imputed_suspect") else ""))
             log(f"  1日変化 d1  : {_fmt(m['d1'])}%")
             log(f"  3日変化 d3  : {_fmt(m['d3'])}%")
+            log(f"  1週間変化d7 : {_fmt(m['d7'])}%")
             log(f"  ma5 / ma20  : {_fmt(m['ma5'], 1)} / {_fmt(m['ma20'], 1)}")
             log(f"  連続日数    : {m['streak']}  (負なら下落が続いている)")
             log(f"  変動の大きさ: {_fmt(m['vol20'])}%")
@@ -980,7 +991,7 @@ def report_card(card_rows: list[dict], query: str, show_days: int = 20) -> int:
 # 履歴は pkc_card_history / pkc_trend が持っているので、
 # こちらは「最新状態の view」として上書き更新する (行は増やさない)。
 # ===========================================================================
-def price_trail(marked: list[dict], n: int = 8) -> str:
+def price_trail(marked: list[dict], n: int = 7) -> str:
     """直近の価格推移を1セルに収める ("139000→137800*→136000")。
 
     末尾に * が付いている日は補完 (取引が無く前日価格を引き継いだ日)。
@@ -1013,6 +1024,7 @@ def build_status_row(card: dict, condition: str, series: list[dict]) -> dict:
         "最新が補完": "★補完" if latest.get("imputed_suspect") else "",
         "d1%": _fmt(m["d1"]),
         "d3%": _fmt(m["d3"]),
+        "d7%": _fmt(m["d7"]),
         "ma5": _fmt(m["ma5"], 1),
         "ma20": _fmt(m["ma20"], 1),
         "連続日数": m["streak"],
@@ -1020,7 +1032,7 @@ def build_status_row(card: dict, condition: str, series: list[dict]) -> dict:
         "有効観測日": m["valid_days"],
         "記録日数": len(marked),
         "判定根拠": basis,
-        "直近推移": price_trail(marked),
+        "直近1週間": price_trail(marked),
         "card_id": card.get("card_id", ""),
         "更新日時": timestamp_jst(),
     }
