@@ -2,6 +2,10 @@ __pycache__/
 *.pyc
 debug_page.html
 debug_screenshot.png
+# スニダン probe モードの成果物 (debug-snkr artifact としてアップロードされる)
+probe_page.html
+probe_screenshot.png
+probe_text.txt
 service_account.json
 .venv/
 .env
