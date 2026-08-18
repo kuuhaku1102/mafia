@@ -27,7 +27,9 @@ import os
 import re
 import sys
 import time
+from datetime import datetime      # ← 追加
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo      # ← 追加
 
 from bs4 import BeautifulSoup
 
