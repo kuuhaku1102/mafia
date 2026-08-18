@@ -65,6 +65,7 @@ BASE_URL / SNKR_* は **絶対に読まない**):
   DRY_RUN=1             スプレッドシートへ書き込まずログ出力のみ
 """
 
+import csv
 import json
 import math
 import os
@@ -818,6 +819,18 @@ def normalize_name(raw: str) -> str:
     return t.strip()
 
 
+def compact_name(raw: str) -> str:
+    """部分一致用に空白・記号・サイト側の品番括弧を除く。"""
+    t = normalize_name(raw).lower()
+    t = re.sub(r"\[[^\]]*\]", "", t)
+    return re.sub(r"[^0-9a-zぁ-んァ-ヶ一-龠々]+", "", t)
+
+
+def names_partially_match(left: str, right: str) -> bool:
+    a, b = compact_name(left), compact_name(right)
+    return bool(a and b and (a in b or b in a))
+
+
 def match_cards(query: str, cards: list[dict]) -> list[dict]:
     """品番 / 名前 / card_id / URL のどれでもカードを引けるようにする。
 
@@ -863,7 +876,19 @@ def match_cards(query: str, cards: list[dict]) -> list[dict]:
 def load_watchlist(sh) -> list[dict]:
     """対象カードの一覧を読む (品番・名前は人間が手入力)。"""
     rows = read_history(sh, WATCHLIST_WS, WATCHLIST_HEADERS)
-    return [r for r in rows if (r.get("品番") or r.get("名前") or r.get("card_id"))]
+    rows = [r for r in rows if (r.get("品番") or r.get("名前") or r.get("card_id"))]
+    if rows:
+        return rows
+
+    # 初回だけ、依頼者提供の対象一覧を空のpkc_watchlistへ投入する。
+    seed_path = os.path.join(os.path.dirname(__file__), "pokeca_watchlist.tsv")
+    if not os.path.exists(seed_path):
+        return []
+    with open(seed_path, encoding="utf-8", newline="") as f:
+        seeded = [dict(r) for r in csv.DictReader(f, delimiter="\t")]
+    seeded = [r for r in seeded if r.get("品番") or r.get("名前")]
+    log(f"  空の{WATCHLIST_WS}に初期ウォッチリスト {len(seeded)}件を読み込みます。")
+    return seeded
 
 
 def resolve_watchlist(sh, watch: list[dict], master: list[dict]) -> list[dict]:
@@ -880,8 +905,7 @@ def resolve_watchlist(sh, watch: list[dict], master: list[dict]) -> list[dict]:
             # 品番と名前の両方があるなら、両方で絞り込んで精度を上げる
             if row.get("品番") and row.get("名前"):
                 both = [c for c in match_cards(row["品番"], master)
-                        if normalize_name(row["名前"]).lower()
-                        in normalize_name(c.get("card_name")).lower()]
+                        if names_partially_match(row["名前"], c.get("card_name"))]
                 hits = both or hits
             if hits:
                 row["card_id"] = hits[0].get("card_id", "")
@@ -1151,11 +1175,33 @@ def plan_upsert(existing_grid, records, headers, key_fields):
 # Playwright 共通
 # ===========================================================================
 def _new_page(browser):
-    return browser.new_page(
+    page = browser.new_page(
         user_agent=USER_AGENT,
         locale="ja-JP",
         viewport={"width": 1366, "height": 900},
     )
+    # API応答は content-type が text/html かつ暗号化されている。サイト自身が
+    # 復号した直後の JSON.parse 入力を捕捉すれば、暗号方式を複製せずに
+    # ブラウザ上で表示された事実だけを取得できる。
+    page.add_init_script("""
+        (() => {
+          window.__pkcParsedPayloads = [];
+          const original = JSON.parse;
+          JSON.parse = function(text, reviver) {
+            const value = original.call(this, text, reviver);
+            try {
+              if (typeof text === 'string' && text.length > 20) {
+                window.__pkcParsedPayloads.push(value);
+                if (window.__pkcParsedPayloads.length > 2000) {
+                  window.__pkcParsedPayloads.shift();
+                }
+              }
+            } catch (_) {}
+            return value;
+          };
+        })();
+    """)
+    return page
 
 
 class NetworkRecorder:
@@ -1255,8 +1301,45 @@ def collect_series(page, recorder: NetworkRecorder) -> list[tuple[str, list[dict
     for blob in find_json_blobs(html):
         for path, series in walk_series(blob):
             found.append((f"埋め込みJSON :: {path}", series))
+    try:
+        parsed = page.evaluate("window.__pkcParsedPayloads || []")
+    except Exception:
+        parsed = []
+    for i, body in enumerate(parsed):
+        for path, series in walk_series(body):
+            found.append((f"ブラウザ復号JSON[{i}] :: {path}", series))
+        # 実APIの chart-data は1日1行に price_01/02/03 と volume を持つ。
+        # それぞれ 美品/キズあり/PSA10 の独立系列へ展開する。
+        for path, rows in walk_chart_rows(body):
+            for status, key in (("美品", "price_01"), ("キズあり", "price_02"), ("PSA10", "price_03")):
+                series = []
+                for row in rows:
+                    price = parse_price(row.get(key))
+                    date = parse_date(row.get("date"))
+                    if date and price is not None:
+                        series.append({"date": date, "price": price,
+                                       "trade_count": parse_price(row.get("volume"))})
+                if series:
+                    found.append((f"ブラウザ復号chart-data[{i}] :: {path} :: {status}", series))
     # 長い系列ほど本命 (backfill に使える) なので先に並べる
     found.sort(key=lambda x: len(x[1]), reverse=True)
+    return found
+
+
+def walk_chart_rows(obj, path: str = "", depth: int = 0):
+    """復号済み chart-data 配列を再帰的に探す。"""
+    if depth > 12:
+        return []
+    found = []
+    if isinstance(obj, list):
+        if obj and all(isinstance(v, dict) for v in obj):
+            if any("date" in v and any(k in v for k in ("price_01", "price_02", "price_03")) for v in obj):
+                found.append((path, obj))
+        for i, value in enumerate(obj):
+            found.extend(walk_chart_rows(value, f"{path}[{i}]", depth + 1))
+    elif isinstance(obj, dict):
+        for key, value in obj.items():
+            found.extend(walk_chart_rows(value, f"{path}.{key}" if path else str(key), depth + 1))
     return found
 
 
@@ -1305,6 +1388,10 @@ def run_probe(url: str) -> int:
             page.screenshot(path="pkc_probe_screenshot.png", full_page=True)
             with open("pkc_probe_network.json", "w", encoding="utf-8") as f:
                 json.dump(recorder.entries, f, ensure_ascii=False, indent=1)
+            parsed_payloads = page.evaluate("window.__pkcParsedPayloads || []")
+            with open("pkc_probe_parsed.json", "w", encoding="utf-8") as f:
+                json.dump(parsed_payloads, f, ensure_ascii=False, indent=1, default=str)
+            log(f"  ブラウザ内JSON.parse捕捉: {len(parsed_payloads)}件")
             log("  pkc_probe_page.html / pkc_probe_text.txt / pkc_probe_screenshot.png "
                 "/ pkc_probe_network.json を保存しました。")
 
@@ -1393,6 +1480,12 @@ def run_probe(url: str) -> int:
 # ===========================================================================
 def _open_and_collect(page, recorder, url: str):
     """1ページ開いて時系列候補を集める共通処理。"""
+    # 同じpageを複数カードに再利用するため、直前カードの復号データを必ず捨てる。
+    try:
+        page.evaluate("window.__pkcParsedPayloads = []")
+    except Exception:
+        pass
+    recorder.json_bodies.clear()
     goto_with_backoff(page, url)
     _wait_any(page, READY_SELECTORS)
     time.sleep(REQUEST_DELAY)
@@ -1468,9 +1561,47 @@ def fetch_master(page, recorder) -> list[dict]:
             log(f"  カード一覧 {len(records)}件 (セレクタ: {sel})")
             break
 
+    # 現行サイトは一覧APIを暗号化して返す。ブラウザ自身が復号したitem情報を使う。
     if not records:
-        log("  ! カード一覧を抽出できませんでした。CARD_LINK_SELECTORS を probe で確認してください。")
+        try:
+            payloads = page.evaluate("window.__pkcParsedPayloads || []")
+        except Exception:
+            payloads = []
+        for item in walk_item_records(payloads):
+            cid = str(item.get("strSlug") or "").strip()
+            name = str(item.get("strName") or "").strip()
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            records.append({
+                "card_id": cid,
+                "card_name": name,
+                "hinban": extract_hinban(name),
+                "url": f"{BASE}/{cid}/",
+                "last_seen_at": timestamp_jst(),
+            })
+        if records:
+            log(f"  カード一覧 {len(records)}件 (ブラウザ復号item API)")
+        else:
+            log("  ! カード一覧を抽出できませんでした。probe 結果を確認してください。")
     return records
+
+
+def walk_item_records(obj, depth: int = 0) -> list[dict]:
+    """復号済みitem APIからカードマスタ行を抽出する。"""
+    if depth > 10:
+        return []
+    found = []
+    if isinstance(obj, dict):
+        if obj.get("strSlug") and obj.get("strName"):
+            found.append(obj)
+        else:
+            for value in obj.values():
+                found.extend(walk_item_records(value, depth + 1))
+    elif isinstance(obj, list):
+        for value in obj:
+            found.extend(walk_item_records(value, depth + 1))
+    return found
 
 
 def extract_hinban(text: str) -> str:
