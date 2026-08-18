@@ -823,6 +823,177 @@ def normalize_name(raw: str) -> str:
     return t.strip()
 
 
+# ===========================================================================
+# カードページの解析（実HTMLで確認済み）
+# ---------------------------------------------------------------------------
+# 実URL: https://pokeca-chart.com/sm12a-192-173/
+#   → スラッグは {セット記号}-{番号}-{分母} を小文字にしたもの。
+#     "かんこうきゃく [SM12a 192/173]" → "sm12a-192-173"
+#
+# ページから直接取れるもの（サーバ側で描画済み。チャートを触らなくてよい）:
+#   ・美品の相場価格   ¥102,000
+#   ・データ数         1,404件
+#   ・7日間変動        +¥28,050 / +27.5%     ← ★これが欲しかった1週間の傾向
+#   ・30日間変動       +¥9,119  / +8.9%
+#   ・ショップ在庫表   状態(PSA10等)ごとの最安値
+#   ・関連カード       他カードへのリンク（巡回の種にできる）
+#   ・JSON-LD (Product) に name / url / offers.price
+#
+# ★7日間変動と30日間変動がページに載っているので、
+#   こちらで20〜30日ぶん貯めるのを待たずに初日から傾向を出せる。
+# ===========================================================================
+def build_card_slug(set_code: str, hinban: str) -> str:
+    """セット記号と品番からURLスラッグを作る。
+
+      ("SM12a", "192/173") -> "sm12a-192-173"
+
+    注意: "SM2+" のように記号を含むセットの変換規則は未確認。
+    その場合は空文字を返し、呼び出し側でマスタ照合に回す。
+    """
+    st = unicodedata.normalize("NFKC", (set_code or "")).strip()
+    hb = normalize_hinban(hinban)
+    if not st or not hb or "/" not in hb:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9]+", st):
+        return ""  # 記号入りセットは規則が未確認なので推測しない
+    num, den = hb.split("/", 1)
+    if not re.fullmatch(r"[A-Za-z0-9\-]+", den):
+        return ""
+    return f"{st.lower()}-{num.lower()}-{den.lower()}"
+
+
+def build_card_url(set_code: str, hinban: str) -> str:
+    """カードページのURLを組み立てる。作れなければ空文字。"""
+    slug = build_card_slug(set_code, hinban)
+    return f"{BASE}/{slug}/" if slug else ""
+
+
+def extract_set_code(text: str) -> str:
+    """カード名からセット記号を取り出す。
+
+      "かんこうきゃく [SM12a 192/173]" -> "SM12a"   (サイト表記)
+      "アセロラ[SM2+] SR 056/049"      -> "SM2+"    (買取表の表記)
+    """
+    t = unicodedata.normalize("NFKC", text or "")
+    for m in re.finditer(r"[\[［]\s*([A-Za-z0-9+\-]{2,8})(?:\s+[0-9]{1,4}/[0-9A-Za-z\-]+)?\s*[\]］]", t):
+        code = m.group(1)
+        # レアリティ表記 (SR/SAR 等) を誤って拾わないよう、数字を含むものを優先
+        if re.search(r"[0-9]", code):
+            return code
+    return ""
+
+
+def parse_card_page(html: str) -> dict:
+    """カードページのHTMLから必要な値をすべて取り出す。
+
+    Playwright を使わずに解析できる（サーバ側で描画済みのため）。
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html or "", "lxml")
+    out: dict = {
+        "card_name": "", "set_code": "", "hinban": "", "url": "",
+        "美品価格": None, "データ数": None,
+        "d7_yen": None, "d7_pct": None, "d30_yen": None, "d30_pct": None,
+        "shops": [], "related": [],
+    }
+
+    # --- JSON-LD (Product) から名前・URL・参考価格 ---
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(tag.string or tag.get_text() or "")
+        except Exception:
+            continue
+        if isinstance(data, dict) and data.get("@type") == "Product":
+            title = data.get("name") or ""
+            out["url"] = data.get("url") or ""
+            offers = data.get("offers") or {}
+            out["ld_price"] = parse_price(offers.get("price"))
+            # "かんこうきゃく [SM12a 192/173]" を名前・セット・品番に割る
+            m = re.match(r"^(.*?)\s*[\[［]\s*([A-Za-z0-9+\-]+)\s+([0-9]{1,4}/[0-9A-Za-z\-]+)\s*[\]］]\s*$", title)
+            if m:
+                out["card_name"] = m.group(1).strip()
+                out["set_code"] = m.group(2)
+                out["hinban"] = normalize_hinban(m.group(3))
+            else:
+                out["card_name"] = title.strip()
+
+    # --- ラベル付きの数値ブロック ---
+    def values_after(label: str, count: int = 2) -> list[str]:
+        for el in soup.find_all(["p", "span", "div"]):
+            if el.get_text(strip=True) == label:
+                vals = []
+                for sib in el.find_next_siblings():
+                    txt = sib.get_text(strip=True)
+                    if txt:
+                        vals.append(txt)
+                    if len(vals) >= count:
+                        break
+                return vals
+        return []
+
+    v = values_after("美品の相場価格", 1)
+    if v:
+        out["美品価格"] = parse_price(v[0])
+    v = values_after("データ数", 1)
+    if v:
+        out["データ数"] = parse_price(v[0])
+    v = values_after("7日間変動", 2)
+    if v:
+        out["d7_yen"] = parse_price(v[0])
+        out["d7_pct"] = parse_pct(v[1]) if len(v) > 1 else None
+    v = values_after("30日間変動", 2)
+    if v:
+        out["d30_yen"] = parse_price(v[0])
+        out["d30_pct"] = parse_pct(v[1]) if len(v) > 1 else None
+
+    # --- ショップ在庫表（状態ごとの最安値） ---
+    for tr in soup.select("table tbody tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 4:
+            continue
+        shop = tds[0].get_text(strip=True)
+        cond = tds[1].get_text(strip=True)
+        stock = tds[2].get_text(strip=True)
+        price = parse_price(tds[3].get_text(strip=True))
+        if shop and price:
+            out["shops"].append(
+                {"shop": shop, "condition": cond, "stock": stock, "price": price}
+            )
+
+    # --- 関連カード（巡回の種として使える） ---
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not re.fullmatch(r"/[a-z0-9]+(?:-[0-9a-z\-]+)+/", href):
+            continue
+        title_el = a.find(attrs={"title": True})
+        title = title_el["title"] if title_el else a.get_text(" ", strip=True)
+        price = None
+        for pl in a.find_all("p"):
+            pv = parse_price(pl.get_text(strip=True))
+            if pv and "¥" in pl.get_text():
+                price = pv
+        out["related"].append({"href": href, "title": title, "price": price})
+
+    return out
+
+
+def shop_min_price(parsed: dict, condition: str) -> int | None:
+    """ショップ在庫表から、指定した状態の最安値を返す。"""
+    rx = re.compile(re.escape(normalize_grade_label(condition)), re.IGNORECASE)
+    prices = [
+        s["price"] for s in (parsed.get("shops") or [])
+        if s.get("price") and rx.search(normalize_grade_label(s.get("condition", "")))
+    ]
+    return min(prices) if prices else None
+
+
+def normalize_grade_label(text: str) -> str:
+    """状態ラベルの表記ゆれを詰める ("PSA 10" -> "PSA10")。"""
+    t = unicodedata.normalize("NFKC", text or "")
+    return re.sub(r"\s+", "", t).upper()
+
+
 # ---------------------------------------------------------------------------
 # 商品名から品番を切り出す / ポケカ以外を見分ける
 # ---------------------------------------------------------------------------

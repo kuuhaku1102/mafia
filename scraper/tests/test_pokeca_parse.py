@@ -682,6 +682,75 @@ def test_duplicate_hinban_flagged():
     assert "品番重複" not in (out[4].get("メモ") or "")
 
 
+# ---------------------------------------------------------------------------
+# ★カードページの解析（実HTMLのfixtureを使用）
+# ---------------------------------------------------------------------------
+def load_card_fixture():
+    with open(os.path.join(HERE, "fixture_pokeca_card.html"), encoding="utf-8") as f:
+        return f.read()
+
+
+def test_parse_card_page():
+    """実ページから必要な値がすべて取れること。
+
+    https://pokeca-chart.com/sm12a-192-173/ の実HTMLで確認した値を固定する。
+    """
+    r = pkc.parse_card_page(load_card_fixture())
+    assert r["card_name"] == "かんこうきゃく"
+    assert r["set_code"] == "SM12a"
+    assert r["hinban"] == "192/173"
+    assert r["url"] == "https://pokeca-chart.com/sm12a-192-173/"
+    assert r["美品価格"] == 102000
+    assert r["データ数"] == 1404
+    # ★1週間・1ヶ月の変動がページに載っている（自前で貯める前から傾向が出せる）
+    assert r["d7_yen"] == 28050 and r["d7_pct"] == 27.5
+    assert r["d30_yen"] == 9119 and r["d30_pct"] == 8.9
+    assert r["ld_price"] == 90000
+
+
+def test_parse_card_page_shops():
+    """ショップ在庫表から状態ごとの最安値が取れること。"""
+    r = pkc.parse_card_page(load_card_fixture())
+    assert len(r["shops"]) == 2
+    assert r["shops"][0]["shop"] == "スニーカーダンク"
+    assert r["shops"][0]["condition"] == "PSA10"
+    assert r["shops"][0]["price"] == 285000
+    # 2店舗のうち安い方を採用する
+    assert pkc.shop_min_price(r, "PSA10") == 285000
+    assert pkc.shop_min_price(r, "美品") is None
+
+
+def test_parse_card_page_related():
+    """関連カードのリンクが取れること（巡回の種に使える）。"""
+    r = pkc.parse_card_page(load_card_fixture())
+    hrefs = [x["href"] for x in r["related"]]
+    assert "/sm12a-190-173/" in hrefs
+    rel = next(x for x in r["related"] if x["href"] == "/sm12a-190-173/")
+    assert "エリカのおもてなし" in rel["title"]
+    assert rel["price"] == 65000
+
+
+def test_build_card_url():
+    """★セット記号＋品番からURLを直接組み立てられる（マスタ照合が不要になる）。"""
+    assert pkc.build_card_url("SM12a", "192/173") == "https://pokeca-chart.com/sm12a-192-173/"
+    assert pkc.build_card_slug("SM12a", "192/173") == "sm12a-192-173"
+    assert pkc.build_card_slug("sv2a", "201/165") == "sv2a-201-165"
+    # 記号を含むセットは変換規則が未確認なので推測しない
+    assert pkc.build_card_slug("SM2+", "056/049") == ""
+    assert pkc.build_card_slug("", "192/173") == ""
+    assert pkc.build_card_slug("SM12a", "") == ""
+
+
+def test_extract_set_code():
+    """カード名からセット記号を取り出す（サイト表記・買取表表記の両方）。"""
+    assert pkc.extract_set_code("かんこうきゃく [SM12a 192/173]") == "SM12a"
+    assert pkc.extract_set_code("アセロラ[SM2+] SR 056/049") == "SM2+"
+    assert pkc.extract_set_code("リザードンex[SV2a] SAR 201/165") == "SV2a"
+    # レアリティだけの角括弧は拾わない
+    assert pkc.extract_set_code("リーリエ【SR】") == ""
+    assert pkc.extract_set_code("マオ") == ""
+
+
 def test_trend_row_has_readable_label():
     """key は機械的なまま、人間向けの名前は label 列に入れる。
 
