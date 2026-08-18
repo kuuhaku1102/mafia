@@ -2,8 +2,8 @@ name: 買取リスト スクレイピング
 
 on:
   schedule:
-    # 毎日 10:00 JST = 01:00 UTC
-    - cron: "0 1 * * *"
+    # 毎30分ごとに実行 (UTC/JSTどちらでも同じ挙動)
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -43,16 +43,19 @@ jobs:
       - name: Run scraper
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          # 未設定の場合は scrape.py 内のデフォルト(指定スプレッドシート / bankシート)を使用
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          WORKSHEET_NAME: ${{ vars.WORKSHEET_NAME || '買取リスト' }}
+          WORKSHEET_NAME: ${{ vars.WORKSHEET_NAME }}
           DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
         run: python scraper/scrape.py
 
-      - name: Upload debug HTML on failure
+      - name: Upload debug artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: debug-page
-          path: debug_page.html
+          path: |
+            debug_page.html
+            debug_screenshot.png
           if-no-files-found: ignore
           retention-days: 7

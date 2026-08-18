@@ -32,10 +32,14 @@ GitHub Actions で実行されるため、サーバーやPCを常時起動する
 
 ### 2. スプレッドシートを準備
 
-1. 書き込み先の Google スプレッドシートを作成 (または既存を使用)。
-2. そのスプレッドシートを、上で控えた **サービスアカウントのメールアドレスに「編集者」として共有**。
-3. URL から **スプレッドシートID** を取得。
-   `https://docs.google.com/spreadsheets/d/`**`<ここがID>`**`/edit`
+書き込み先は既定で以下に設定済みです (変更する場合は `scraper/scrape.py` の
+`DEFAULT_SPREADSHEET_ID` / `DEFAULT_WORKSHEET_NAME`、または Secrets/Variables で上書き)。
+
+- スプレッドシート: `1XZQO4j7gu-p9IsK3sfaQp4q9O2bH893C2PMv2h_xqzE`
+- シート(タブ): `bank`
+
+1. 上記スプレッドシートを、控えた **サービスアカウントのメールアドレスに「編集者」として共有**。
+2. `bank` という名前のシート(タブ)を用意 (無い場合は自動作成されます)。
 
 ### 3. GitHub Secrets / Variables を登録
 
@@ -43,9 +47,12 @@ GitHub Actions で実行されるため、サーバーやPCを常時起動する
 
 | 種別 | 名前 | 値 |
 |------|------|----|
-| Secret | `GOOGLE_SERVICE_ACCOUNT_JSON` | ダウンロードした JSON ファイルの**中身全体** |
-| Secret | `SPREADSHEET_ID` | スプレッドシートID |
-| Variable (任意) | `WORKSHEET_NAME` | 書き込み先シート名 (既定: `買取リスト`) |
+| Secret | `GOOGLE_SERVICE_ACCOUNT_JSON` | ダウンロードした JSON ファイルの**中身全体** (必須) |
+| Secret (任意) | `SPREADSHEET_ID` | スプレッドシートID (未設定時は既定値を使用) |
+| Variable (任意) | `WORKSHEET_NAME` | 書き込み先シート名 (既定: `bank`) |
+
+> `GOOGLE_SERVICE_ACCOUNT_JSON` のみ必須です。`SPREADSHEET_ID` / `WORKSHEET_NAME` は
+> 未設定なら `scraper/scrape.py` の既定値 (上記スプレッドシート / `bank` シート) が使われます。
 
 ### 4. 動作確認
 

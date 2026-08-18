@@ -1,0 +1,31 @@
+name: CI (parser tests)
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scraper/requirements.txt
+
+      # パーサーテストに必要な依存のみ (Playwright ブラウザは不要)
+      - name: Install test dependencies
+        run: pip install beautifulsoup4 lxml
+
+      - name: Run parser tests
+        run: python scraper/tests/test_parse.py
+
+      - name: Syntax check
+        run: python -m py_compile scraper/scrape.py
