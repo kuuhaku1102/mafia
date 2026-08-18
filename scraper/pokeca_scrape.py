@@ -216,12 +216,9 @@ DOWN_D3 = float(os.environ.get("PKC_DOWN_D3") or "-0.8")     # 依頼書の -1.0
 DOWN_STREAK = int(os.environ.get("PKC_DOWN_STREAK") or "-2")
 UP_D3 = float(os.environ.get("PKC_UP_D3") or "1.5")          # 依頼書の +1.0 より厳しい
 UP_STREAK = int(os.environ.get("PKC_UP_STREAK") or "3")      # 依頼書の +2 より厳しい
-# ★直近1週間ぶんの実測があれば方向は読める。
-# 用途が「2〜3日先にどちらへ動くか」なので、10日待たせるのは過剰だった。
-# ただし7日だと ma5 と ma20 の重なりが大きく、移動平均の比較は弱くなる
-# (7日しか無ければ ma20 は7日の平均になり、うち5日が ma5 と共通)。
-# その分は d3 / d7 / streak が補う。信頼度は valid_days 列で見ること。
-MIN_VALID_DAYS = int(os.environ.get("PKC_MIN_VALID_DAYS") or "7")
+# 依頼要件どおり、有効観測日が10日未満なら無理に方向を判定しない。
+# PKC_MIN_VALID_DAYS で運用時に厳しくすることはできるが、10未満には下げない。
+MIN_VALID_DAYS = max(10, int(os.environ.get("PKC_MIN_VALID_DAYS") or "10"))
 BUFFER_MULTIPLIER = float(os.environ.get("PKC_BUFFER_MULTIPLIER") or "2.0")
 
 # --- User-Agent ------------------------------------------------------------
