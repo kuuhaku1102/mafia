@@ -329,6 +329,83 @@ def test_iter_json_values():
     assert any(isinstance(v, list) and len(v) == 2 for v in vals)
 
 
+# ---------------------------------------------------------------------------
+# 対象カードの指定・照会 (品番/名前の表記ゆれを吸収して引けること)
+# ---------------------------------------------------------------------------
+def test_normalize_hinban_and_name():
+    """★ハイフン文字セットを品番用と名前用で分ける。
+
+    品番の U+FF70 は '-' に寄せる必要があるが、
+    同じ変換を名前に当てると長音が壊れる。
+    """
+    assert pkc.normalize_hinban("006/165 ") == "006/165"
+    assert pkc.normalize_hinban("211/SMｰP") == "211/SM-P"   # 半角カナ長音
+    assert pkc.normalize_hinban("211/SMーP") == "211/SM-P"   # 全角カナ長音
+    assert pkc.normalize_hinban("296/XY-p") == "296/XY-P"
+
+    # 名前の長音は絶対に壊さない
+    assert pkc.normalize_name("ルイージピカチュウ") == "ルイージピカチュウ"
+    assert pkc.normalize_name("ブラッキーVMax") == "ブラッキーVMax"
+    assert pkc.normalize_name("リーリエの決心") == "リーリエの決心"
+    # 全角英字・全角スペース・セル内改行は吸収する
+    assert pkc.normalize_name("ガブリアス＆ギラティナＧＸ") == "ガブリアス&ギラティナGX"
+    assert pkc.normalize_name("リザードン\n\n") == "リザードン"
+
+
+def test_match_cards():
+    """品番 / 名前 / card_id のどれでもカードを引ける。"""
+    cards = [
+        {"card_id": "rizadon-006", "card_name": "リザードンex", "hinban": "006/165"},
+        {"card_id": "pikachu-211", "card_name": "ルイージピカチュウ", "hinban": "211/SMｰP"},
+        {"card_id": "blacky-082", "card_name": "ブラッキーVMax", "hinban": "082/069"},
+    ]
+    # 品番で引く (表記ゆれを吸収)
+    assert pkc.match_cards("006/165", cards)[0]["card_id"] == "rizadon-006"
+    assert pkc.match_cards("211/SM-P", cards)[0]["card_id"] == "pikachu-211"
+    assert pkc.match_cards("211/SMｰP", cards)[0]["card_id"] == "pikachu-211"
+    # 名前で引く (完全一致・部分一致)
+    assert pkc.match_cards("ブラッキーVMax", cards)[0]["card_id"] == "blacky-082"
+    assert pkc.match_cards("リザードン", cards)[0]["card_id"] == "rizadon-006"
+    # card_id で引く
+    assert pkc.match_cards("blacky-082", cards)[0]["card_id"] == "blacky-082"
+    # URL で引く
+    assert pkc.match_cards(
+        "https://pokeca-chart.com/card/blacky-082/", cards
+    )[0]["card_id"] == "blacky-082"
+    # 見つからないものは空
+    assert pkc.match_cards("存在しないカード", cards) == []
+    assert pkc.match_cards("", cards) == []
+
+
+def test_match_cards_ranking():
+    """完全一致が部分一致より上に来る。"""
+    cards = [
+        {"card_id": "a", "card_name": "リザードンex SAR", "hinban": "201/165"},
+        {"card_id": "b", "card_name": "リザードン", "hinban": "006/165"},
+    ]
+    hits = pkc.match_cards("リザードン", cards)
+    assert hits[0]["card_id"] == "b", [h["card_id"] for h in hits]
+    assert len(hits) == 2  # 候補は絞らず全部返して人間に選ばせる
+
+
+def test_trend_row_has_readable_label():
+    """key は機械的なまま、人間向けの名前は label 列に入れる。
+
+    key を人間向けにすると、カード名が変わった瞬間に別行として増えてしまう。
+    """
+    row = pkc.build_trend_row(
+        "card", "rizadon-006|美品",
+        [{"date": f"2026-08-{i+1:02d}", "price": 200 - i * 3, "trade_count": 2}
+         for i in range(20)],
+        label="リザードンex [006/165] 美品",
+    )
+    assert row["key"] == "rizadon-006|美品"
+    assert row["label"] == "リザードンex [006/165] 美品"
+    assert "label" in pkc.TREND_HEADERS
+    # label は upsert キーに含めない (名前が変わっても同じ行を更新する)
+    assert "label" not in pkc.TREND_KEY_FIELDS
+
+
 def test_request_delay_floor():
     """★相手先への配慮: リクエスト間隔は下限未満に下げられない。"""
     assert pkc.REQUEST_DELAY >= pkc.MIN_REQUEST_DELAY

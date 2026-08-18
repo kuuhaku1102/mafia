@@ -163,6 +163,11 @@ INDEX_WS = os.environ.get("PKC_INDEX_WORKSHEET") or "pkc_index_history"
 CARD_WS = os.environ.get("PKC_CARD_WORKSHEET") or "pkc_card_history"
 MASTER_WS = os.environ.get("PKC_MASTER_WORKSHEET") or "pkc_card_master"
 TREND_WS = os.environ.get("PKC_TREND_WORKSHEET") or "pkc_trend"
+WATCHLIST_WS = os.environ.get("PKC_WATCHLIST_WORKSHEET") or "pkc_watchlist"
+# card モードで調べたい銘柄 (品番 / 名前 / card_id / URL のいずれか)
+CARD_QUERY = (os.environ.get("PKC_CARD_QUERY") or "").strip()
+# 直近何日ぶんを card モードの明細表に出すか
+SHOW_DAYS = int(os.environ.get("PKC_SHOW_DAYS") or "20")
 
 INDEX_HEADERS = ["date", "index_type", "value", "diff", "diff_pct", "fetched_at"]
 CARD_HEADERS = [
@@ -170,8 +175,11 @@ CARD_HEADERS = [
     "price", "trade_count", "imputed_suspect", "fetched_at",
 ]
 MASTER_HEADERS = ["card_id", "card_name", "hinban", "url", "last_seen_at"]
+# ★対象カードの指定用。品番と名前を手入力すれば、そのカードだけを巡回する。
+# 5秒間隔・1日1回では全カードを回りきれないので、実運用ではこれで絞る。
+WATCHLIST_HEADERS = ["品番", "名前", "card_id", "url", "メモ"]
 TREND_HEADERS = [
-    "date", "scope", "key", "d1", "d3", "ma5", "ma20", "streak", "vol20",
+    "date", "scope", "key", "label", "d1", "d3", "ma5", "ma20", "streak", "vol20",
     "valid_days", "trend", "suggested_buffer_pct", "imputation_basis", "fetched_at",
 ]
 
@@ -179,6 +187,7 @@ TREND_HEADERS = [
 INDEX_KEY_FIELDS = ["date", "index_type"]
 CARD_KEY_FIELDS = ["date", "card_id", "condition"]
 MASTER_KEY_FIELDS = ["card_id"]
+WATCHLIST_KEY_FIELDS = ["品番", "名前"]
 TREND_KEY_FIELDS = ["date", "scope", "key"]
 
 # --- 傾向判定の閾値 -------------------------------------------------------
@@ -689,14 +698,21 @@ def _fmt(v, digits: int = 2) -> str:
     return str(v)
 
 
-def build_trend_row(scope: str, key: str, series: list[dict], date: str = "") -> dict:
-    """1銘柄 (またはグループ・指数) 分の傾向行を作る。"""
+def build_trend_row(scope: str, key: str, series: list[dict], date: str = "",
+                    label: str = "") -> dict:
+    """1銘柄 (またはグループ・指数) 分の傾向行を作る。
+
+    key は upsert の一意キーなので機械的な値 (card_id|condition) を保つ。
+    人間が読むための名前は label 列に別で入れる (key を人間向けにすると
+    カード名が変わった瞬間に別行として増えてしまうため)。
+    """
     m = compute_metrics(series)
     trend = classify_trend(m)
     return {
         "date": date or m.get("last_date") or today_jst(),
         "scope": scope,
         "key": key,
+        "label": label or key,
         "d1": _fmt(m["d1"]),
         "d3": _fmt(m["d3"]),
         "ma5": _fmt(m["ma5"], 1),
@@ -748,6 +764,199 @@ def group_series(rows: list[dict], group_of) -> dict:
             for d in sorted(by_date)
         ]
     return out
+
+
+# ===========================================================================
+# 銘柄の名寄せと検索 (対象カードを指定・照会するため)
+# ---------------------------------------------------------------------------
+# 買取表側の品番・名前には表記ゆれが混ざる。マスタと突き合わせる前に正規化する。
+# ★ハイフン文字セットは品番用と名前用で分ける。
+#   品番の "SMｰP" は NFKC で長音「ー」になるので '-' に寄せる必要があるが、
+#   同じ変換を名前に当てると「ルイージ」「ブラッキー」が壊れる。
+# ===========================================================================
+_COMMON_HYPHENS = "-­‐‑‒–—―⁃−－"          # 名前にも当ててよいハイフン類
+_CODE_HYPHENS = _COMMON_HYPHENS + "ーｰ"    # 品番のみ (品番にカタカナは出ない)
+_CODE_HYPHEN_RE = re.compile("[" + re.escape(_CODE_HYPHENS) + "]")
+_NAME_HYPHEN_RE = re.compile("[" + re.escape(_COMMON_HYPHENS) + "]")
+_SPACE_RE = re.compile(r"[\s　 ]+")
+
+
+def normalize_hinban(raw: str) -> str:
+    """品番を正規化する ("006/165 " -> "006/165", "211/SMｰP" -> "211/SM-P")。"""
+    t = unicodedata.normalize("NFKC", raw or "")
+    t = _CODE_HYPHEN_RE.sub("-", t)
+    t = _SPACE_RE.sub("", t)
+    return t.upper()
+
+
+def normalize_name(raw: str) -> str:
+    """カード名を正規化する。長音記号は絶対に '-' へ変えない。"""
+    t = unicodedata.normalize("NFKC", raw or "")
+    t = _NAME_HYPHEN_RE.sub("-", t)
+    t = _SPACE_RE.sub(" ", t)
+    return t.strip()
+
+
+def match_cards(query: str, cards: list[dict]) -> list[dict]:
+    """品番 / 名前 / card_id / URL のどれでもカードを引けるようにする。
+
+    一致の強い順に並べて返す (完全一致 → 前方一致 → 部分一致)。
+    候補が複数出ることは普通にあるので、絞り込まず全部返して人間に選ばせる。
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    q_hin = normalize_hinban(q)
+    q_name = normalize_name(q).lower()
+    q_slug = slug_from_url(q) if "/" in q and "://" in q else ""
+
+    scored = []
+    for c in cards or []:
+        cid = (c.get("card_id") or "").strip()
+        hin = normalize_hinban(c.get("hinban"))
+        name = normalize_name(c.get("card_name")).lower()
+
+        score = 0
+        if q_slug and cid == q_slug:
+            score = 100
+        elif cid and cid.lower() == q.lower():
+            score = 100
+        elif hin and q_hin and hin == q_hin:
+            score = 90
+        elif name and name == q_name:
+            score = 80
+        elif name and q_name and name.startswith(q_name):
+            score = 60
+        elif name and q_name and q_name in name:
+            score = 40
+        elif hin and q_hin and q_hin in hin:
+            score = 30
+
+        if score:
+            scored.append((score, c))
+
+    scored.sort(key=lambda x: (-x[0], x[1].get("card_name") or ""))
+    return [c for _, c in scored]
+
+
+def load_watchlist(sh) -> list[dict]:
+    """対象カードの一覧を読む (品番・名前は人間が手入力)。"""
+    rows = read_history(sh, WATCHLIST_WS, WATCHLIST_HEADERS)
+    return [r for r in rows if (r.get("品番") or r.get("名前") or r.get("card_id"))]
+
+
+def resolve_watchlist(sh, watch: list[dict], master: list[dict]) -> list[dict]:
+    """ウォッチリストの各行にマスタから card_id / url を埋める。
+
+    既に card_id が入っている行は触らない (人間が手で直した値を尊重する)。
+    """
+    resolved = []
+    for r in watch:
+        row = dict(r)
+        if not row.get("card_id"):
+            q = row.get("品番") or row.get("名前") or ""
+            hits = match_cards(q, master)
+            # 品番と名前の両方があるなら、両方で絞り込んで精度を上げる
+            if row.get("品番") and row.get("名前"):
+                both = [c for c in match_cards(row["品番"], master)
+                        if normalize_name(row["名前"]).lower()
+                        in normalize_name(c.get("card_name")).lower()]
+                hits = both or hits
+            if hits:
+                row["card_id"] = hits[0].get("card_id", "")
+                row["url"] = hits[0].get("url", "")
+                if len(hits) > 1:
+                    row["メモ"] = f"候補{len(hits)}件から先頭を採用（要確認）"
+                log(f"  照合: {q} -> {hits[0].get('card_name')} ({row['card_id']})")
+            else:
+                row["メモ"] = "マスタに見つかりません（手でcard_id/urlを入れてください）"
+                log(f"  ! 照合できませんでした: {q}")
+        resolved.append(row)
+    return resolved
+
+
+# ===========================================================================
+# card モード: 対象カードが今どうなっているかを照会する
+# ---------------------------------------------------------------------------
+# サイトへはアクセスしない。蓄積済みの履歴だけで答えるので何度でも実行できる。
+# ===========================================================================
+def _trend_mark(trend: str) -> str:
+    return {"下落": "▼下落", "上昇": "▲上昇", "横ばい": "→横ばい"}.get(trend, "?判定不可")
+
+
+def report_card(card_rows: list[dict], query: str, show_days: int = 20) -> int:
+    """1銘柄の状態をログに出す。戻り値は見つかった系列の数。"""
+    cards = []
+    seen = set()
+    for r in card_rows:
+        cid = r.get("card_id", "")
+        if cid and cid not in seen:
+            seen.add(cid)
+            cards.append({
+                "card_id": cid,
+                "card_name": r.get("card_name", ""),
+                "hinban": r.get("hinban", ""),
+            })
+
+    hits = match_cards(query, cards)
+    if not hits:
+        log(f"! '{query}' に一致するカードが履歴にありません。")
+        log("  pkc_card_master / pkc_card_history に入っているか確認してください。")
+        return 0
+
+    if len(hits) > 1:
+        log(f"'{query}' の候補が {len(hits)} 件あります。すべて表示します。")
+
+    shown = 0
+    for card in hits[:5]:
+        cid = card["card_id"]
+        rows = [r for r in card_rows if r.get("card_id") == cid]
+        conditions = sorted({r.get("condition", "") for r in rows})
+
+        log("")
+        log("=" * 72)
+        log(f" {card.get('card_name') or cid}  [{card.get('hinban') or '品番不明'}]  ({cid})")
+        log("=" * 72)
+
+        for cond in conditions:
+            crows = [r for r in rows if r.get("condition", "") == cond]
+            series = _to_series(crows)
+            if not series:
+                continue
+            shown += 1
+            m = compute_metrics(series)
+            trend = classify_trend(m)
+            marked, basis = mark_imputed(series)
+            latest = marked[-1] if marked else {}
+
+            log("")
+            log(f"--- 状態: {cond or '不明'} ---")
+            log(f"  傾向        : {_trend_mark(trend)}")
+            log(f"  最新価格    : {latest.get('price', '-')} 円 ({latest.get('date', '-')})"
+                + ("  ※この日は取引なし（補完値）" if latest.get("imputed_suspect") else ""))
+            log(f"  1日変化 d1  : {_fmt(m['d1'])}%")
+            log(f"  3日変化 d3  : {_fmt(m['d3'])}%")
+            log(f"  ma5 / ma20  : {_fmt(m['ma5'], 1)} / {_fmt(m['ma20'], 1)}")
+            log(f"  連続日数    : {m['streak']}  (負なら下落が続いている)")
+            log(f"  変動の大きさ: {_fmt(m['vol20'])}%")
+            log(f"  有効観測日  : {m['valid_days']}日 / 記録{len(marked)}日"
+                f"  (判定には{MIN_VALID_DAYS}日必要)")
+            log(f"  判定根拠    : {basis}"
+                + ("  ※取引件数が無いため精度が落ちます" if basis == "price_repeat" else ""))
+            if trend == "下落":
+                buf = suggested_buffer_pct(m, trend)
+                log(f"  ★買取率から {buf}% ほど引くことを検討してください")
+            elif trend == "判定不可":
+                log("  ★実測が足りません。いつもより慎重に。")
+
+            # 直近の明細。補完日が一目で分かるようにする。
+            log(f"  直近{show_days}日:")
+            log(f"    {'日付':<12}{'価格':>10}{'取引':>6}  備考")
+            for r in marked[-show_days:]:
+                tc = r.get("trade_count")
+                note = "補完(取引なし)" if r.get("imputed_suspect") else ""
+                log(f"    {r['date']:<12}{r['price']:>10}{('-' if tc is None else tc):>6}  {note}")
+    return shown
 
 
 # ===========================================================================
@@ -1381,7 +1590,10 @@ def compute_all_trends(index_rows: list[dict], card_rows: list[dict]) -> list[di
         by_card.setdefault(key, []).append(r)
     for (cid, cond), rows in by_card.items():
         series = _to_series(rows)
-        out.append(build_trend_row("card", f"{cid}|{cond}", series))
+        name = next((r.get("card_name") for r in reversed(rows) if r.get("card_name")), "")
+        hinban = next((r.get("hinban") for r in reversed(rows) if r.get("hinban")), "")
+        label = " ".join(x for x in [name, hinban and f"[{hinban}]", cond] if x)
+        out.append(build_trend_row("card", f"{cid}|{cond}", series, label=label))
 
     # --- グループ集約 (condition 単位。個別より安定する) ---
     series_by_group = group_series(
@@ -1455,7 +1667,8 @@ def log_trend_summary(rows: list[dict]) -> None:
 # ===========================================================================
 # main
 # ===========================================================================
-VALID_MODES = ("probe", "backfill", "index", "cards", "master", "trend", "daily")
+VALID_MODES = ("probe", "backfill", "index", "cards", "master", "trend", "daily",
+               "card", "watchlist")
 
 
 def main() -> int:
@@ -1484,6 +1697,48 @@ def main() -> int:
         return 1
 
     sh = _open_spreadsheet()
+
+    # --- card は蓄積済みデータだけで動く (サイトへアクセスしない) ---
+    # 「この銘柄は今どうなってる?」を調べるためのモード。
+    # 何度実行しても相手先に負荷はかからない。
+    if MODE == "card":
+        if not CARD_QUERY:
+            log("ERROR: PKC_CARD_QUERY が未設定です。調べたい銘柄を指定してください。")
+            log("  品番 / カード名 / card_id / カードURL のいずれでも引けます。")
+            log("  例: PKC_MODE=card PKC_CARD_QUERY='006/165' python scraper/pokeca_scrape.py")
+            return 1
+        card_rows = read_history(sh, CARD_WS, CARD_HEADERS)
+        if not card_rows:
+            log(f"! {CARD_WS} に履歴がありません。先に daily を走らせてください。")
+            return 1
+        log(f"=== 銘柄照会: '{CARD_QUERY}' (履歴 {len(card_rows)}行から検索) ===")
+        if report_card(card_rows, CARD_QUERY, SHOW_DAYS) == 0:
+            return 1
+        log("")
+        log("=== 完了 ===")
+        return 0
+
+    # --- watchlist はマスタと突き合わせて card_id / url を埋めるだけ ---
+    if MODE == "watchlist":
+        master = read_history(sh, MASTER_WS, MASTER_HEADERS)
+        if not master:
+            log(f"! {MASTER_WS} が空です。先に PKC_MODE=master を走らせてください。")
+            return 1
+        watch = load_watchlist(sh)
+        if not watch:
+            log(f"! {WATCHLIST_WS} が空です。品番と名前を手入力してください。")
+            _get_or_create(sh, WATCHLIST_WS, WATCHLIST_HEADERS) if not dry_run else None
+            return 0
+        log(f"=== ウォッチリストの照合: {len(watch)}件 ===")
+        resolved = resolve_watchlist(sh, watch, master)
+        upsert_to_sheet(sh, WATCHLIST_WS, WATCHLIST_HEADERS, resolved,
+                        WATCHLIST_KEY_FIELDS, dry_run)
+        unresolved = [r for r in resolved if not r.get("card_id")]
+        if unresolved:
+            log(f"! {len(unresolved)}件が未解決です。{WATCHLIST_WS} の card_id / url を")
+            log("  手で埋めてください。埋めた行は次回以降そのまま使われます。")
+        log("=== 完了 ===")
+        return 0
 
     # --- trend は蓄積済みデータだけで動く (サイトへアクセスしない) ---
     if MODE == "trend":
@@ -1530,11 +1785,39 @@ def main() -> int:
                 master_records = fetch_master(page, recorder)
 
             if MODE in ("cards", "daily", "backfill"):
-                cards = master_records or [
+                all_cards = master_records or [
                     {"card_id": r.get("card_id", ""), "card_name": r.get("card_name", ""),
                      "hinban": r.get("hinban", ""), "url": r.get("url", "")}
                     for r in read_history(sh, MASTER_WS, MASTER_HEADERS)
                 ]
+
+                # ★ウォッチリストがあれば、そこに載っている銘柄だけを巡回する。
+                # 5秒間隔・1日1回では全カードは回りきれないので、実運用では必須。
+                watch = load_watchlist(sh)
+                if watch:
+                    watch = resolve_watchlist(sh, watch, all_cards)
+                    if not dry_run:
+                        upsert_to_sheet(sh, WATCHLIST_WS, WATCHLIST_HEADERS, watch,
+                                        WATCHLIST_KEY_FIELDS, dry_run)
+                    wanted = {w["card_id"] for w in watch if w.get("card_id")}
+                    cards = [c for c in all_cards if c.get("card_id") in wanted]
+                    # マスタに無いがURLを手入力した行も巡回対象にする
+                    known = {c.get("card_id") for c in cards}
+                    for w in watch:
+                        if w.get("url") and w.get("card_id") not in known:
+                            cards.append({
+                                "card_id": w.get("card_id") or slug_from_url(w["url"]),
+                                "card_name": w.get("名前", ""),
+                                "hinban": w.get("品番", ""),
+                                "url": w["url"],
+                            })
+                    log(f"  ウォッチリスト {len(watch)}件 -> 巡回対象 {len(cards)}件")
+                else:
+                    cards = all_cards
+                    log(f"  ウォッチリスト未設定のため全 {len(cards)}件が対象です。")
+                    log(f"  ! 1件あたり{REQUEST_DELAY}秒待つため、件数が多いと時間内に終わりません。")
+                    log(f"  ! {WATCHLIST_WS} シートに品番と名前を入れて対象を絞ることを推奨します。")
+
                 cards = [c for c in cards if c.get("url")]
                 if MAX_ITEMS > 0:
                     cards = cards[:MAX_ITEMS]
