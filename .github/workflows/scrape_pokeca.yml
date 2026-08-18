@@ -59,13 +59,31 @@ jobs:
       - name: Install dependencies
         run: pip install -r scraper/requirements.txt
 
+      # ★--with-deps は apt-get update を走らせるため、Ubuntu のパッケージミラーが
+      #   不調だとここで延々ハングする（実測: archive.ubuntu.com で13分停止 → 手動キャンセル）。
+      #   ブラウザ本体のダウンロードに apt は不要なので、まずそちらだけ入れる。
       - name: Install Playwright browser
-        run: python -m playwright install --with-deps chromium
+        timeout-minutes: 10
+        run: |
+          python -m playwright install chromium || {
+            echo "ダウンロードに失敗しました。10秒待って再試行します。"
+            sleep 10
+            python -m playwright install chromium
+          }
+
+      # 共有ライブラリは ubuntu-latest ランナーにほぼ揃っている。
+      # 足りない場合の保険だが、apt が不調でもジョブ全体を止めないよう
+      # 時間を区切ったうえで、失敗しても続行する。
+      - name: Install Playwright system deps (best effort)
+        timeout-minutes: 8
+        continue-on-error: true
+        run: python -m playwright install-deps chromium
 
       - name: Run parser tests
         run: python scraper/tests/test_pokeca_parse.py
 
       - name: Run pokeca scraper
+        timeout-minutes: 100
         env:
           # 既存と共有してよいのはこの2つだけ
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
