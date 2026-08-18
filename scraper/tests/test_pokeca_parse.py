@@ -426,6 +426,74 @@ def test_match_cards_ranking():
     assert len(hits) == 2  # 候補は絞らず全部返して人間に選ばせる
 
 
+# ---------------------------------------------------------------------------
+# ★ウォッチリストの照合は「品番+名前」で確定させる
+# ---------------------------------------------------------------------------
+# 品番は弾をまたぐと重複する ("006/165" は複数のセットに存在しうる)。
+# 品番だけで先頭を機械的に採用すると、別のカードを掴む。
+MASTER = [
+    {"card_id": "sv2a-006", "card_name": "リザードンex", "hinban": "006/165"},
+    {"card_id": "old-006", "card_name": "ヤミラミ", "hinban": "006/165"},   # 品番が重複
+    {"card_id": "luigi-211", "card_name": "ルイージピカチュウ", "hinban": "211/SMｰP"},
+]
+
+
+def test_watchlist_hinban_plus_name_resolves():
+    """品番+名前が両方合えば一意に確定する。"""
+    best, cands, reason = pkc.match_watchlist_row(
+        {"品番": "006/165", "名前": "リザードンex"}, MASTER)
+    assert best["card_id"] == "sv2a-006"
+    assert reason == ""
+
+    # 同じ品番でも名前が違えば別のカードを引く
+    best2, _, _ = pkc.match_watchlist_row({"品番": "006/165", "名前": "ヤミラミ"}, MASTER)
+    assert best2["card_id"] == "old-006"
+
+
+def test_watchlist_hinban_only_is_ambiguous():
+    """★品番だけで候補が複数なら確定させない（別カードを掴む事故を防ぐ）。"""
+    best, cands, reason = pkc.match_watchlist_row({"品番": "006/165"}, MASTER)
+    assert best is None, "品番だけで先頭を勝手に採用してはいけない"
+    assert len(cands) == 2
+    assert "名前も入力" in reason
+
+    # 品番だけでも候補が1件なら確定してよい
+    best2, _, reason2 = pkc.match_watchlist_row({"品番": "211/SM-P"}, MASTER)
+    assert best2["card_id"] == "luigi-211"
+    assert reason2 == ""
+
+
+def test_watchlist_name_mismatch_does_not_fall_back():
+    """★品番は合うが名前が合わない場合、品番だけの候補で代用しない。"""
+    best, cands, reason = pkc.match_watchlist_row(
+        {"品番": "006/165", "名前": "存在しないカード"}, MASTER)
+    assert best is None
+    assert "名前が合いません" in reason
+    assert len(cands) == 2  # 候補は人間に見せる
+
+
+def test_watchlist_normalizes_hinban_variants():
+    """表記ゆれの品番でも同じカードに当たる。"""
+    for h in ("211/SMｰP", "211/SM-P", "211/SMーP", "211/sm-p ", "２１１／ＳＭ－Ｐ"):
+        best, _, _ = pkc.match_watchlist_row({"品番": h, "名前": "ルイージピカチュウ"}, MASTER)
+        assert best and best["card_id"] == "luigi-211", h
+
+
+def test_watchlist_row_key_is_hinban_plus_name():
+    """upsert キーが品番+名前なので、同じ銘柄が2行に増えない。"""
+    assert pkc.WATCHLIST_KEY_FIELDS == ["品番", "名前"]
+    a = {"品番": "006/165", "名前": "リザードンex"}
+    b = {"品番": "006/165", "名前": "ヤミラミ"}
+    assert pkc.record_key(a, pkc.WATCHLIST_KEY_FIELDS) != pkc.record_key(b, pkc.WATCHLIST_KEY_FIELDS)
+
+
+def test_watchlist_empty_row_reports_reason():
+    """空行は理由を返す（黙って無視しない）。"""
+    best, _, reason = pkc.match_watchlist_row({"品番": "", "名前": ""}, MASTER)
+    assert best is None
+    assert "入力してください" in reason
+
+
 def test_trend_row_has_readable_label():
     """key は機械的なまま、人間向けの名前は label 列に入れる。
 

@@ -869,32 +869,83 @@ def load_watchlist(sh) -> list[dict]:
     return [r for r in rows if (r.get("品番") or r.get("名前") or r.get("card_id"))]
 
 
+def match_watchlist_row(row: dict, master: list[dict]) -> tuple[dict | None, list[dict], str]:
+    """ウォッチリスト1行をマスタと突き合わせる。
+
+    ★品番は弾をまたぐと重複する ("006/165" は複数のセットに存在しうる)。
+    品番だけで機械的に先頭を採用すると別のカードを掴む。
+    そのため以下の方針にする。
+
+      品番+名前あり : 両方に一致するものだけを採用。
+                      一致しなければ「解決できない」として人間に返す
+                      (品番だけの候補で代用しない)
+      片方だけ      : 候補がちょうど1件のときだけ採用。
+                      複数あるなら候補を列挙して人間に選ばせる
+
+    返り値: (採用したカード or None, 候補一覧, 理由テキスト)
+    """
+    hinban = (row.get("品番") or "").strip()
+    name = (row.get("名前") or "").strip()
+
+    if hinban and name:
+        by_hinban = match_cards(hinban, master)
+        n = normalize_name(name).lower()
+        both = [c for c in by_hinban
+                if n and n in normalize_name(c.get("card_name")).lower()]
+        if len(both) == 1:
+            return both[0], both, ""
+        if len(both) > 1:
+            return both[0], both, f"品番+名前で候補{len(both)}件。先頭を採用（要確認）"
+        # ★品番だけの候補で代用しない。別のカードを掴む危険がある。
+        if by_hinban:
+            names = " / ".join((c.get("card_name") or "")[:20] for c in by_hinban[:5])
+            return None, by_hinban, f"品番は一致するが名前が合いません（候補: {names}）"
+        return None, [], "品番・名前ともマスタに見つかりません"
+
+    q = hinban or name
+    if not q:
+        return None, [], "品番か名前を入力してください"
+
+    hits = match_cards(q, master)
+    if len(hits) == 1:
+        return hits[0], hits, ""
+    if len(hits) > 1:
+        names = " / ".join((c.get("card_name") or "")[:20] for c in hits[:5])
+        # 名前が空だと絞り込めない。ここで勝手に決めない。
+        return None, hits, f"候補{len(hits)}件。名前も入力して絞り込んでください（{names}）"
+    return None, [], "マスタに見つかりません"
+
+
 def resolve_watchlist(sh, watch: list[dict], master: list[dict]) -> list[dict]:
     """ウォッチリストの各行にマスタから card_id / url を埋める。
 
     既に card_id が入っている行は触らない (人間が手で直した値を尊重する)。
+    確定できない行は card_id を空のままにし、理由をメモ欄に書いて人間に返す。
     """
     resolved = []
     for r in watch:
         row = dict(r)
-        if not row.get("card_id"):
-            q = row.get("品番") or row.get("名前") or ""
-            hits = match_cards(q, master)
-            # 品番と名前の両方があるなら、両方で絞り込んで精度を上げる
-            if row.get("品番") and row.get("名前"):
-                both = [c for c in match_cards(row["品番"], master)
-                        if normalize_name(row["名前"]).lower()
-                        in normalize_name(c.get("card_name")).lower()]
-                hits = both or hits
-            if hits:
-                row["card_id"] = hits[0].get("card_id", "")
-                row["url"] = hits[0].get("url", "")
-                if len(hits) > 1:
-                    row["メモ"] = f"候補{len(hits)}件から先頭を採用（要確認）"
-                log(f"  照合: {q} -> {hits[0].get('card_name')} ({row['card_id']})")
-            else:
-                row["メモ"] = "マスタに見つかりません（手でcard_id/urlを入れてください）"
-                log(f"  ! 照合できませんでした: {q}")
+        # 品番は表記ゆれを吸収して書き戻す (同じ銘柄が別行として増えるのを防ぐ)
+        if row.get("品番"):
+            row["品番"] = normalize_hinban(row["品番"])
+        if row.get("名前"):
+            row["名前"] = normalize_name(row["名前"])
+
+        if row.get("card_id") or row.get("url"):
+            resolved.append(row)
+            continue
+
+        best, candidates, reason = match_watchlist_row(row, master)
+        label = f"{row.get('品番', '')} {row.get('名前', '')}".strip()
+        if best:
+            row["card_id"] = best.get("card_id", "")
+            row["url"] = best.get("url", "")
+            row["メモ"] = reason
+            log(f"  照合: {label} -> {best.get('card_name')} ({row['card_id']})"
+                + (f"  ※{reason}" if reason else ""))
+        else:
+            row["メモ"] = reason
+            log(f"  ! 照合できません: {label} — {reason}")
         resolved.append(row)
     return resolved
 
@@ -1855,7 +1906,9 @@ def main() -> int:
         watch = load_watchlist(sh)
         if not watch:
             log(f"! {WATCHLIST_WS} が空です。品番と名前を手入力してください。")
-            _get_or_create(sh, WATCHLIST_WS, WATCHLIST_HEADERS) if not dry_run else None
+            if not dry_run:
+                _get_or_create(sh, WATCHLIST_WS, WATCHLIST_HEADERS)
+                log(f"  空の {WATCHLIST_WS} シートを用意しました。品番と名前を入れてください。")
             return 0
         log(f"=== ウォッチリストの照合: {len(watch)}件 ===")
         resolved = resolve_watchlist(sh, watch, master)
