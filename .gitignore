@@ -6,6 +6,11 @@ debug_screenshot.png
 probe_page.html
 probe_screenshot.png
 probe_text.txt
+# みんなのポケカ相場 probe モードの成果物 (debug-pokeca artifact)
+pkc_probe_page.html
+pkc_probe_screenshot.png
+pkc_probe_text.txt
+pkc_probe_network.json
 service_account.json
 .venv/
 .env

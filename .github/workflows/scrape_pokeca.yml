@@ -1,0 +1,103 @@
+name: みんなのポケカ相場 スクレイピング
+
+on:
+  schedule:
+    # ★1日1回のみ。15:00 UTC = JST 0時。
+    # 相手先は個人運営の無料ファンサイトなので、30分おきは絶対にやらない。
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "実行モード"
+        required: false
+        default: "daily"
+        type: choice
+        options: ["daily", "probe", "index", "cards", "master", "trend", "backfill"]
+      probe_url:
+        description: "probe モードで開くURL (未指定ならトップページ)"
+        required: false
+        default: ""
+      since:
+        description: "backfill の開始日 (YYYY-MM-DD)"
+        required: false
+        default: ""
+      max_items:
+        description: "処理件数の上限 (0 = 無制限。テスト時は 5 など)"
+        required: false
+        default: "0"
+      dry_run:
+        description: "スプレッドシートへ書き込まず動作確認のみ (1で有効)"
+        required: false
+        default: "0"
+
+# 既存の bank 側 (group: scrape) / スニダン側 (group: scrape-snkr) とは別グループ。
+# 重複させると互いに待ち合わせが発生する。
+concurrency:
+  group: scrape-pokeca
+  cancel-in-progress: false
+
+jobs:
+  scrape-pokeca:
+    runs-on: ubuntu-latest
+    # backfill は件数が多く、1件ごとに5秒以上待つため長めに取る
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scraper/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r scraper/requirements.txt
+
+      - name: Install Playwright browser
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run parser tests
+        run: python scraper/tests/test_pokeca_parse.py
+
+      - name: Run pokeca scraper
+        env:
+          # 既存と共有してよいのはこの2つだけ
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          # 以降はすべて PKC_ 名前空間 (bank / snkr の挙動に影響させない)
+          PKC_MODE: ${{ github.event.inputs.mode || 'daily' }}
+          PKC_PROBE_URL: ${{ github.event.inputs.probe_url }}
+          PKC_SINCE: ${{ github.event.inputs.since }}
+          PKC_MAX_ITEMS: ${{ github.event.inputs.max_items || '0' }}
+          PKC_INDEX_WORKSHEET: ${{ vars.PKC_INDEX_WORKSHEET }}
+          PKC_CARD_WORKSHEET: ${{ vars.PKC_CARD_WORKSHEET }}
+          PKC_MASTER_WORKSHEET: ${{ vars.PKC_MASTER_WORKSHEET }}
+          PKC_TREND_WORKSHEET: ${{ vars.PKC_TREND_WORKSHEET }}
+          # 既定 5.0 秒。これ未満には下げられない (スクリプト側で下限を強制)
+          PKC_REQUEST_DELAY: ${{ vars.PKC_REQUEST_DELAY }}
+          # ★相手先への配慮: User-Agent に入れる連絡先。必ず設定すること
+          PKC_CONTACT: ${{ vars.PKC_CONTACT }}
+          # 傾向判定の閾値 (未設定ならスクリプトの非対称な既定値)
+          PKC_DOWN_D3: ${{ vars.PKC_DOWN_D3 }}
+          PKC_DOWN_STREAK: ${{ vars.PKC_DOWN_STREAK }}
+          PKC_UP_D3: ${{ vars.PKC_UP_D3 }}
+          PKC_UP_STREAK: ${{ vars.PKC_UP_STREAK }}
+          PKC_MIN_VALID_DAYS: ${{ vars.PKC_MIN_VALID_DAYS }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+        run: python scraper/pokeca_scrape.py
+
+      - name: Upload probe artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # 既存の debug-page / debug-snkr とは別名
+          name: debug-pokeca
+          path: |
+            pkc_probe_page.html
+            pkc_probe_screenshot.png
+            pkc_probe_text.txt
+            pkc_probe_network.json
+          if-no-files-found: ignore
+          retention-days: 7
