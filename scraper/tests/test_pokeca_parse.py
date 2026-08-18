@@ -203,18 +203,56 @@ def _series(prices, trade_count=3, start_day=1):
 
 
 def test_trend_undecidable_when_few_valid_days():
-    """有効観測日が10日未満の銘柄は判定不可 (無理に判定しない)。"""
+    """有効観測日が MIN_VALID_DAYS 未満の銘柄は判定不可 (無理に判定しない)。"""
     m = pkc.compute_metrics(_series([100, 99, 98, 97, 96]))
     assert m["valid_days"] == 5
     assert pkc.classify_trend(m) == "判定不可"
 
-    # 20日ぶんあっても、取引があったのが9日だけなら判定不可
+    # 20日ぶんあっても、取引があったのが数日だけなら判定不可
     rows = _series([100 - i for i in range(20)])
-    for r in rows[9:]:
+    for r in rows[pkc.MIN_VALID_DAYS - 1:]:
         r["trade_count"] = 0
     m2 = pkc.compute_metrics(rows)
-    assert m2["valid_days"] == 9
+    assert m2["valid_days"] == pkc.MIN_VALID_DAYS - 1
     assert pkc.classify_trend(m2) == "判定不可"
+
+
+def test_one_week_is_enough_to_judge():
+    """★直近1週間ぶんの実測があれば方向を判定できる。
+
+    用途が「2〜3日先にどちらへ動くか」なので、判定開始を1週間にしてある。
+    """
+    assert pkc.MIN_VALID_DAYS == 7
+
+    # 有効観測7日ちょうどの下落系列
+    m = pkc.compute_metrics(_series([200 - i * 3 for i in range(7)]))
+    assert m["valid_days"] == 7
+    assert pkc.classify_trend(m) == "下落", m
+    # 7日ちょうどでも d7 が出ること (7観測ぶんの幅として計算する)
+    assert m["d7"] is not None and m["d7"] < 0
+    assert float(pkc.suggested_buffer_pct(m, "下落")) > 0
+
+    # 6日では判定不可のまま
+    m6 = pkc.compute_metrics(_series([200 - i * 3 for i in range(6)]))
+    assert m6["valid_days"] == 6
+    assert pkc.classify_trend(m6) == "判定不可"
+    assert m6["d7"] is None
+
+
+def test_d7_uses_valid_observations_only():
+    """d7 は「有効観測7日ぶん」の幅。補完日は数に入れない。
+
+    薄い銘柄では実時間で2週間以上をまたぐことがある (それが正しい)。
+    """
+    # 14日ぶんあるが、取引があったのは1日おきの7日だけ
+    rows = _series([100 - i for i in range(14)])
+    for i, r in enumerate(rows):
+        if i % 2 == 1:
+            r["trade_count"] = 0
+    m = pkc.compute_metrics(rows)
+    assert m["valid_days"] == 7
+    # 有効な7点は 100, 98, 96, 94, 92, 90, 88 -> (88/100 - 1) * 100
+    assert abs(m["d7"] - (-12.0)) < 0.01, m["d7"]
 
 
 def test_trend_down():
@@ -327,6 +365,218 @@ def test_iter_json_values():
     text = 'a:b:[{"date":"2026-08-01","price":100},{"date":"2026-08-02","price":110}] tail'
     vals = list(pkc.iter_json_values(text))
     assert any(isinstance(v, list) and len(v) == 2 for v in vals)
+
+
+# ---------------------------------------------------------------------------
+# 対象カードの指定・照会 (品番/名前の表記ゆれを吸収して引けること)
+# ---------------------------------------------------------------------------
+def test_normalize_hinban_and_name():
+    """★ハイフン文字セットを品番用と名前用で分ける。
+
+    品番の U+FF70 は '-' に寄せる必要があるが、
+    同じ変換を名前に当てると長音が壊れる。
+    """
+    assert pkc.normalize_hinban("006/165 ") == "006/165"
+    assert pkc.normalize_hinban("211/SMｰP") == "211/SM-P"   # 半角カナ長音
+    assert pkc.normalize_hinban("211/SMーP") == "211/SM-P"   # 全角カナ長音
+    assert pkc.normalize_hinban("296/XY-p") == "296/XY-P"
+
+    # 名前の長音は絶対に壊さない
+    assert pkc.normalize_name("ルイージピカチュウ") == "ルイージピカチュウ"
+    assert pkc.normalize_name("ブラッキーVMax") == "ブラッキーVMax"
+    assert pkc.normalize_name("リーリエの決心") == "リーリエの決心"
+    # 全角英字・全角スペース・セル内改行は吸収する
+    assert pkc.normalize_name("ガブリアス＆ギラティナＧＸ") == "ガブリアス&ギラティナGX"
+    assert pkc.normalize_name("リザードン\n\n") == "リザードン"
+
+
+def test_match_cards():
+    """品番 / 名前 / card_id のどれでもカードを引ける。"""
+    cards = [
+        {"card_id": "rizadon-006", "card_name": "リザードンex", "hinban": "006/165"},
+        {"card_id": "pikachu-211", "card_name": "ルイージピカチュウ", "hinban": "211/SMｰP"},
+        {"card_id": "blacky-082", "card_name": "ブラッキーVMax", "hinban": "082/069"},
+    ]
+    # 品番で引く (表記ゆれを吸収)
+    assert pkc.match_cards("006/165", cards)[0]["card_id"] == "rizadon-006"
+    assert pkc.match_cards("211/SM-P", cards)[0]["card_id"] == "pikachu-211"
+    assert pkc.match_cards("211/SMｰP", cards)[0]["card_id"] == "pikachu-211"
+    # 名前で引く (完全一致・部分一致)
+    assert pkc.match_cards("ブラッキーVMax", cards)[0]["card_id"] == "blacky-082"
+    assert pkc.match_cards("リザードン", cards)[0]["card_id"] == "rizadon-006"
+    # card_id で引く
+    assert pkc.match_cards("blacky-082", cards)[0]["card_id"] == "blacky-082"
+    # URL で引く
+    assert pkc.match_cards(
+        "https://pokeca-chart.com/card/blacky-082/", cards
+    )[0]["card_id"] == "blacky-082"
+    # 見つからないものは空
+    assert pkc.match_cards("存在しないカード", cards) == []
+    assert pkc.match_cards("", cards) == []
+
+
+def test_match_cards_ranking():
+    """完全一致が部分一致より上に来る。"""
+    cards = [
+        {"card_id": "a", "card_name": "リザードンex SAR", "hinban": "201/165"},
+        {"card_id": "b", "card_name": "リザードン", "hinban": "006/165"},
+    ]
+    hits = pkc.match_cards("リザードン", cards)
+    assert hits[0]["card_id"] == "b", [h["card_id"] for h in hits]
+    assert len(hits) == 2  # 候補は絞らず全部返して人間に選ばせる
+
+
+def test_trend_row_has_readable_label():
+    """key は機械的なまま、人間向けの名前は label 列に入れる。
+
+    key を人間向けにすると、カード名が変わった瞬間に別行として増えてしまう。
+    """
+    row = pkc.build_trend_row(
+        "card", "rizadon-006|美品",
+        [{"date": f"2026-08-{i+1:02d}", "price": 200 - i * 3, "trade_count": 2}
+         for i in range(20)],
+        label="リザードンex [006/165] 美品",
+    )
+    assert row["key"] == "rizadon-006|美品"
+    assert row["label"] == "リザードンex [006/165] 美品"
+    assert "label" in pkc.TREND_HEADERS
+    # label は upsert キーに含めない (名前が変わっても同じ行を更新する)
+    assert "label" not in pkc.TREND_KEY_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# 現況ボード (対象カードの最新状態をシートへ転記する)
+# ---------------------------------------------------------------------------
+def _hist(cid, name, hinban, cond, prices, counts):
+    return [
+        {"date": f"2026-08-{i + 1:02d}", "card_id": cid, "card_name": name,
+         "hinban": hinban, "condition": cond, "price": str(p), "trade_count": str(c)}
+        for i, (p, c) in enumerate(zip(prices, counts))
+    ]
+
+
+def test_price_trail_marks_imputed():
+    """直近推移のセルで、補完日に * が付く。"""
+    marked, _ = pkc.mark_imputed([
+        {"date": "2026-08-01", "price": 100, "trade_count": 2},
+        {"date": "2026-08-02", "price": 100, "trade_count": 0},   # 補完
+        {"date": "2026-08-03", "price": 98, "trade_count": 1},
+    ])
+    assert pkc.price_trail(marked) == "100→100*→98"
+    assert pkc.price_trail([]) == ""
+
+
+def test_price_trail_is_one_week():
+    """直近推移は1週間ぶん (7観測) を1セルに収める。"""
+    marked, _ = pkc.mark_imputed([
+        {"date": f"2026-08-{i + 1:02d}", "price": 100 - i, "trade_count": 2}
+        for i in range(20)
+    ])
+    trail = pkc.price_trail(marked)
+    assert len(trail.split("→")) == 7, trail
+    assert trail.endswith("81")  # 最新が末尾
+
+
+def test_status_has_d7_column():
+    """現況ボードに1週間の変化率が載る。"""
+    rows = _hist("a", "カードA", "001/100", "美品",
+                 [200 - i * 3 for i in range(20)], [2] * 20)
+    r = pkc.build_status_rows(rows)[0]
+    assert "d7%" in pkc.STATUS_HEADERS
+    assert "直近1週間" in pkc.STATUS_HEADERS
+    assert float(r["d7%"]) < 0
+    assert "d7" in pkc.TREND_HEADERS
+
+
+def test_build_status_rows():
+    """1銘柄1行の現況行が作られる。"""
+    rows = _hist("riza-006", "リザードンex", "006/165", "美品",
+                 [200 - i * 3 for i in range(20)], [2] * 20)
+    status = pkc.build_status_rows(rows)
+    assert len(status) == 1
+    r = status[0]
+    for h in pkc.STATUS_HEADERS:
+        assert h in r, h
+    assert r["品番"] == "006/165"
+    assert r["名前"] == "リザードンex"
+    assert r["状態"] == "美品"
+    assert r["傾向"] == "下落"
+    assert r["card_id"] == "riza-006"
+    assert float(r["買取調整%"]) > 0
+    assert r["有効観測日"] == 20
+    assert "→" in r["直近1週間"]
+
+
+def test_status_flags_imputed_latest():
+    """最新日が補完だった場合に、その価格が実測でないことが見える。"""
+    rows = _hist("x", "テスト", "001/100", "美品",
+                 [100 - i for i in range(19)] + [82], [2] * 19 + [0])
+    r = pkc.build_status_rows(rows)[0]
+    assert r["最新が補完"] == "★補完"
+    assert r["直近1週間"].endswith("*")
+
+
+def test_status_only_watchlisted_cards():
+    """★品番を入れた銘柄だけをボードに載せる。"""
+    rows = (
+        _hist("a", "カードA", "001/100", "美品", [100 - i for i in range(20)], [2] * 20)
+        + _hist("b", "カードB", "002/100", "美品", [100 - i for i in range(20)], [2] * 20)
+    )
+    both = pkc.build_status_rows(rows)
+    assert {r["card_id"] for r in both} == {"a", "b"}
+
+    only_a = pkc.build_status_rows(rows, only_ids={"a"})
+    assert {r["card_id"] for r in only_a} == {"a"}
+    assert pkc.build_status_rows(rows, only_ids=set()) == []
+
+
+def test_status_sorted_by_urgency():
+    """注意が要る順 (下落 → 判定不可 → 横ばい → 上昇) に並ぶ。"""
+    rows = (
+        _hist("up", "上昇", "003/100", "美品", [100 + i * 3 for i in range(20)], [2] * 20)
+        + _hist("down", "下落", "001/100", "美品", [200 - i * 3 for i in range(20)], [2] * 20)
+        + _hist("few", "判定不可", "002/100", "美品", [100, 99, 98], [2] * 3)
+    )
+    status = pkc.build_status_rows(rows)
+    assert [r["傾向"] for r in status][:2] == ["下落", "判定不可"], [r["傾向"] for r in status]
+
+
+def test_status_upsert_does_not_grow_rows():
+    """★現況ボードは行が増えない (1銘柄1行を上書き更新する view)。
+
+    日付をキーに含めないので、毎日走らせても行数は一定。
+    履歴は pkc_card_history / pkc_trend 側が持つ。
+    """
+    rows = _hist("a", "カードA", "001/100", "美品",
+                 [100 - i for i in range(20)], [2] * 20)
+    day1 = pkc.build_status_rows(rows)
+    header, appends, _, stats = pkc.plan_upsert(
+        [], day1, pkc.STATUS_HEADERS, pkc.STATUS_KEY_FIELDS)
+    assert stats["appended"] == 1
+
+    grid = [header] + appends
+    # 翌日: 価格が1日ぶん増えても行は増えず、既存行が更新される
+    rows2 = rows + _hist("a", "カードA", "001/100", "美品", [79], [3])
+    rows2[-1]["date"] = "2026-08-21"
+    day2 = pkc.build_status_rows(rows2)
+    _, appends2, updates2, stats2 = pkc.plan_upsert(
+        grid, day2, pkc.STATUS_HEADERS, pkc.STATUS_KEY_FIELDS)
+    assert stats2["appended"] == 0, stats2
+    assert stats2["updated"] == 1, stats2
+
+
+def test_status_separates_conditions():
+    """同じカードでも状態(美品/PSA10)ごとに別行になる。"""
+    rows = (
+        _hist("a", "カードA", "001/100", "美品", [100 - i for i in range(20)], [2] * 20)
+        + _hist("a", "カードA", "001/100", "PSA10", [500 - i for i in range(20)], [2] * 20)
+    )
+    status = pkc.build_status_rows(rows)
+    assert len(status) == 2
+    assert {r["状態"] for r in status} == {"美品", "PSA10"}
+    # キーが状態を含むので互いを上書きしない
+    keys = {pkc.record_key(r, pkc.STATUS_KEY_FIELDS) for r in status}
+    assert len(keys) == 2
 
 
 def test_request_delay_floor():

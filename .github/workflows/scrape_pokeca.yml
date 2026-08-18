@@ -12,7 +12,11 @@ on:
         required: false
         default: "daily"
         type: choice
-        options: ["daily", "probe", "index", "cards", "master", "trend", "backfill"]
+        options: ["daily", "card", "watchlist", "probe", "index", "cards", "master", "trend", "backfill"]
+      card_query:
+        description: "card モードで調べる銘柄 (品番 / カード名 / card_id / URL)"
+        required: false
+        default: ""
       probe_url:
         description: "probe モードで開くURL (未指定ならトップページ)"
         required: false
@@ -69,6 +73,11 @@ jobs:
           # 以降はすべて PKC_ 名前空間 (bank / snkr の挙動に影響させない)
           PKC_MODE: ${{ github.event.inputs.mode || 'daily' }}
           PKC_PROBE_URL: ${{ github.event.inputs.probe_url }}
+          PKC_CARD_QUERY: ${{ github.event.inputs.card_query }}
+          PKC_WATCHLIST_WORKSHEET: ${{ vars.PKC_WATCHLIST_WORKSHEET }}
+          PKC_STATUS_WORKSHEET: ${{ vars.PKC_STATUS_WORKSHEET }}
+          # ウォッチリストが空のとき全カードを巡回してよいか (既定: しない)
+          PKC_CRAWL_ALL: ${{ vars.PKC_CRAWL_ALL }}
           PKC_SINCE: ${{ github.event.inputs.since }}
           PKC_MAX_ITEMS: ${{ github.event.inputs.max_items || '0' }}
           PKC_INDEX_WORKSHEET: ${{ vars.PKC_INDEX_WORKSHEET }}
