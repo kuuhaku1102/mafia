@@ -180,7 +180,9 @@ CARD_HEADERS = [
 MASTER_HEADERS = ["card_id", "card_name", "hinban", "url", "last_seen_at"]
 # ★対象カードの指定用。品番と名前を手入力すれば、そのカードだけを巡回する。
 # 5秒間隔・1日1回では全カードを回りきれないので、実運用ではこれで絞る。
-WATCHLIST_HEADERS = ["品番", "名前", "card_id", "url", "メモ"]
+# 商品名を1列に貼り付けるだけでも使えるようにする（買取表からのコピペ想定）。
+# 品番と名前はスクリプトが商品名から切り出して埋める。
+WATCHLIST_HEADERS = ["商品名", "品番", "名前", "card_id", "url", "メモ"]
 # ★対象カードの現況ボード。毎朝これを見て買取価格を決める想定。
 # 履歴は pkc_card_history / pkc_trend が持つので、こちらは
 # 「1銘柄1行の最新状態」を上書き更新する view として扱う (行は増やさない)。
@@ -821,6 +823,127 @@ def normalize_name(raw: str) -> str:
     return t.strip()
 
 
+# ---------------------------------------------------------------------------
+# 商品名から品番を切り出す / ポケカ以外を見分ける
+# ---------------------------------------------------------------------------
+# ★pokeca-chart.com はポケモンカード専門サイト。
+# 買取表にはドラゴンボール・ヴァイスシュヴァルツ・遊戯王・ワンピース・
+# 未開封BOX なども混ざっているが、これらはこのサイトには載っていない。
+# 照合できないのは入力の誤りではないので、「対象外」として区別する。
+OTHER_TCG_PATTERNS = [
+    ("ドラゴンボールFW", r"\b(?:FB|SB|FS)\d{2}-\d{2,3}\b"),
+    ("ヴァイスシュヴァルツ", r"\b[A-Z][A-Za-z]{1,4}/[SW]\w?\d+-[A-Z]?\d+[A-Z+]*\b"),
+    ("遊戯王", r"\b[A-Z0-9]{3,6}-JP[A-Z]?\d{2,3}\b"),
+    ("ワンピースカード", r"\b(?:OP|ST|EB)\d{2}-\d{3}\b"),
+    ("未開封BOX等", r"【未開封BOX】|未開封BOX|拡張パック|強化拡張パック|スタートデッキ|ハイクラスパック"),
+    ("エナジーマーカー", r"エナジーマーカー"),
+]
+
+# ポケカの品番。"397/SM-P" "056/049" "0709/09" "020/M-P" などに当たる。
+# ヴァイス (HOL/W104-082SSP) は英字始まりなので当たらない。
+_HINBAN_RE = re.compile(
+    r"(\d{1,4}\s*/\s*(?:\d{1,4}|[A-Za-z]{1,3}(?:-[A-Za-z])?))(?![0-9/])",
+    re.IGNORECASE,
+)
+# 旧裏・旧弾の "No.006" 形式
+_NO_RE = re.compile(r"\bNo\.\s*(\d{1,4})\b", re.IGNORECASE)
+
+
+def _tidy_name(name: str) -> str:
+    """品番を抜いたあとに残る区切り記号を掃除する ("オカルトマニア[XY] -" -> "...[XY]")。"""
+    t = normalize_name(name)
+    return re.sub(r"[\s\-–—・/]+$", "", t).strip()
+
+
+def classify_product(name: str) -> str:
+    """商品名がポケカか、他TCG等かを判定する。
+
+    戻り値: "ポケカ" もしくは他TCGの名称。
+    """
+    t = unicodedata.normalize("NFKC", name or "")
+    for label, pat in OTHER_TCG_PATTERNS:
+        if re.search(pat, t):
+            return label
+    return "ポケカ"
+
+
+def split_product_name(product: str) -> tuple[str, str]:
+    """買取表の商品名を (品番, 名前) に切り分ける。
+
+      "リーリエ(エクストラバトルの日) PROMO 397/SM-P"
+        -> ("397/SM-P", "リーリエ(エクストラバトルの日) PROMO")
+      "リザードン LV.76[OP1] ★ No.006"
+        -> ("No.006", "リザードン LV.76[OP1] ★")
+      品番が見つからなければ ("", 商品名全体)
+    """
+    t = unicodedata.normalize("NFKC", product or "").strip()
+    if not t:
+        return "", ""
+
+    # 品番は末尾に付くことが多いので最後の一致を採用する
+    matches = list(_HINBAN_RE.finditer(t))
+    if matches:
+        m = matches[-1]
+        hinban = normalize_hinban(m.group(1))
+        name = (t[: m.start()] + " " + t[m.end():]).strip()
+        return hinban, _tidy_name(name)
+
+    m = _NO_RE.search(t)
+    if m:
+        name = (t[: m.start()] + " " + t[m.end():]).strip()
+        return f"No.{m.group(1)}", _tidy_name(name)
+
+    return "", _tidy_name(t)
+
+
+# 買取表の名前には [SM2+] のようなセット記号や SR / SAR などのレアリティが付く。
+# マスタ側は "アセロラ" のように素の名前であることが多く、
+# 単純な包含判定だと「買取表の名前の方が長い」ケースで外れる。
+# 比較用に、装飾を落とした「核となる名前」を作って突き合わせる。
+_BRACKET_RE = re.compile(r"[\[［【｛{][^\]］】｝}]*[\]］】｝}]")
+_RARITY_TOKENS = (
+    "SAR|SSP|SSR|CSR|CHR|MUR|PROMO|SEC|RRR|SR|RR|UR|HR|AR|MA|SP|LP|"
+    "S|P|C|U|R|K"
+)
+_RARITY_TAIL_RE = re.compile(
+    r"(?:\s|^)(?:" + _RARITY_TOKENS + r")(?:\(SA\)|\(sa\))?\s*$", re.IGNORECASE
+)
+_SYMBOL_RE = re.compile(r"[★☆◇◆:：\-–—]+")
+
+
+def core_name(name: str) -> str:
+    """比較用の「核となる名前」を作る。
+
+      "アセロラ[SM2+] SR"        -> "アセロラ"
+      "リザードンex[SV2a] SAR"    -> "リザードンex"
+      "ピカチュウ&ゼクロムGX[SM9] SR(SA)" -> "ピカチュウ&ゼクロムGX"
+    括弧書きの補足 (例: "(大)") は意味を持つことがあるので残す。
+    """
+    t = normalize_name(name)
+    t = _BRACKET_RE.sub(" ", t)          # [SM2+] 【...】 などを除去
+    t = _SYMBOL_RE.sub(" ", t)           # ★ ☆ : - などを除去
+    t = _SPACE_RE.sub(" ", t).strip()
+    # 末尾のレアリティ表記を繰り返し落とす ("SR(SA)" -> "SR" -> なし)
+    for _ in range(4):
+        new = _RARITY_TAIL_RE.sub("", t).strip()
+        if new == t:
+            break
+        t = new
+    return t.lower()
+
+
+def names_match(a: str, b: str) -> bool:
+    """2つのカード名が同じ銘柄を指しているか。
+
+    ★包含は双方向で見る。買取表側が長い ("アセロラ[SM2+] SR") ことも、
+    マスタ側が長い ("アセロラ(エクストラバトルの日)") こともあるため。
+    """
+    ca, cb = core_name(a), core_name(b)
+    if not ca or not cb:
+        return False
+    return ca == cb or ca in cb or cb in ca
+
+
 def match_cards(query: str, cards: list[dict]) -> list[dict]:
     """品番 / 名前 / card_id / URL のどれでもカードを引けるようにする。
 
@@ -849,9 +972,11 @@ def match_cards(query: str, cards: list[dict]) -> list[dict]:
             score = 90
         elif name and name == q_name:
             score = 80
+        elif name and q_name and core_name(name) == core_name(q_name):
+            score = 70
         elif name and q_name and name.startswith(q_name):
             score = 60
-        elif name and q_name and q_name in name:
+        elif name and q_name and names_match(name, q_name):
             score = 40
         elif hin and q_hin and q_hin in hin:
             score = 30
@@ -866,7 +991,8 @@ def match_cards(query: str, cards: list[dict]) -> list[dict]:
 def load_watchlist(sh) -> list[dict]:
     """対象カードの一覧を読む (品番・名前は人間が手入力)。"""
     rows = read_history(sh, WATCHLIST_WS, WATCHLIST_HEADERS)
-    return [r for r in rows if (r.get("品番") or r.get("名前") or r.get("card_id"))]
+    return [r for r in rows
+            if (r.get("商品名") or r.get("品番") or r.get("名前") or r.get("card_id"))]
 
 
 def match_watchlist_row(row: dict, master: list[dict]) -> tuple[dict | None, list[dict], str]:
@@ -889,9 +1015,7 @@ def match_watchlist_row(row: dict, master: list[dict]) -> tuple[dict | None, lis
 
     if hinban and name:
         by_hinban = match_cards(hinban, master)
-        n = normalize_name(name).lower()
-        both = [c for c in by_hinban
-                if n and n in normalize_name(c.get("card_name")).lower()]
+        both = [c for c in by_hinban if names_match(name, c.get("card_name"))]
         if len(both) == 1:
             return both[0], both, ""
         if len(both) > 1:
@@ -922,9 +1046,34 @@ def resolve_watchlist(sh, watch: list[dict], master: list[dict]) -> list[dict]:
     既に card_id が入っている行は触らない (人間が手で直した値を尊重する)。
     確定できない行は card_id を空のままにし、理由をメモ欄に書いて人間に返す。
     """
+    # ★マスタが空なら照合しても全件外れる。205行のエラーを並べても意味がないので、
+    #   原因（設定が未確定）を1行で伝えて、入力はそのまま返す。
+    if not master:
+        log("! マスタ（カード一覧）が0件です。ウォッチリストの照合をスキップします。")
+        log("  原因は入力ではなく、カード一覧を取得できていないことです。")
+        log("  PKC_MODE=probe でセレクタ／エンドポイントを確定させてください。")
+        return [dict(r) for r in watch]
+
     resolved = []
+    unresolved_labels = []
+    skipped: dict[str, int] = {}
     for r in watch:
         row = dict(r)
+
+        # 商品名だけ貼られた行は、ここで品番と名前に切り分ける
+        product = (row.get("商品名") or "").strip()
+        if product and not (row.get("品番") or row.get("名前")):
+            hinban, name = split_product_name(product)
+            row["品番"], row["名前"] = hinban, name
+
+        # ★ポケカ以外はこのサイトに載っていない。照合エラーではなく「対象外」。
+        category = classify_product(product or f"{row.get('品番','')} {row.get('名前','')}")
+        if category != "ポケカ":
+            row["メモ"] = f"対象外（{category}）"
+            skipped[category] = skipped.get(category, 0) + 1
+            resolved.append(row)
+            continue
+
         # 品番は表記ゆれを吸収して書き戻す (同じ銘柄が別行として増えるのを防ぐ)
         if row.get("品番"):
             row["品番"] = normalize_hinban(row["品番"])
@@ -945,8 +1094,23 @@ def resolve_watchlist(sh, watch: list[dict], master: list[dict]) -> list[dict]:
                 + (f"  ※{reason}" if reason else ""))
         else:
             row["メモ"] = reason
-            log(f"  ! 照合できません: {label} — {reason}")
+            unresolved_labels.append(f"{label} — {reason}")
         resolved.append(row)
+
+    # ポケカ以外は「照合できなかった」ではなく「そもそも対象外」。分けて報告する。
+    if skipped:
+        total = sum(skipped.values())
+        log(f"  対象外（このサイトはポケモンカード専門）: {total}件")
+        for k, v in sorted(skipped.items(), key=lambda x: -x[1]):
+            log(f"      {k}: {v}件")
+
+    # 未解決が大量にあるとログが埋まるので、先頭だけ出して残りは件数で示す
+    if unresolved_labels:
+        log(f"  ! 照合できない行が {len(unresolved_labels)}件 あります:")
+        for line in unresolved_labels[:10]:
+            log(f"      {line}")
+        if len(unresolved_labels) > 10:
+            log(f"      …ほか {len(unresolved_labels) - 10}件（メモ欄に理由が入っています）")
     return resolved
 
 
@@ -1976,7 +2140,11 @@ def main() -> int:
                 # 1件あたり REQUEST_DELAY 秒待つため全カード巡回は現実的に終わらず、
                 # 相手先(個人運営の無料ファンサイト)への負荷も過大になる。
                 watch = load_watchlist(sh)
-                if watch:
+                if watch and not all_cards:
+                    log(f"! マスタが0件のため、カード別価格の取得をスキップします "
+                        f"(ウォッチリストには {len(watch)}件 入っています)。")
+                    cards = []
+                elif watch:
                     watch = resolve_watchlist(sh, watch, all_cards)
                     if not dry_run:
                         upsert_to_sheet(sh, WATCHLIST_WS, WATCHLIST_HEADERS, watch,
@@ -2059,6 +2227,25 @@ def main() -> int:
         trends = compute_all_trends(index_rows, card_rows)
         log_trend_summary(trends)
         upsert_to_sheet(sh, TREND_WS, TREND_HEADERS, trends, TREND_KEY_FIELDS, dry_run)
+
+    # ★何も取れなかった実行を「成功」で終わらせない。
+    # 毎晩の cron が黙って空振りし続けるのが最悪なので、明確に失敗させる。
+    if MODE in ("index", "cards", "master", "daily", "backfill") and not (
+        index_records or card_records or master_records
+    ):
+        log("")
+        log("=" * 68)
+        log("ERROR: 1件も取得できませんでした。")
+        log("  DOM / API のセレクタが未確定である可能性が高いです。")
+        log("  次の手順で確定させてください:")
+        log("    1. PKC_MODE=probe / dry_run=1 で実行")
+        log("    2. ログの「JSONを返したエンドポイント」と")
+        log("       「★取引件数 (trade_count) の取得可否」を確認")
+        log("    3. artifact debug-pokeca の pkc_probe_network.json を見て、")
+        log("       scraper/pokeca_scrape.py 冒頭の【要設定】ブロックを実際の値に直す")
+        log("       (URLS / DATE_KEYS / PRICE_KEYS / COUNT_KEYS / CARD_LINK_SELECTORS)")
+        log("=" * 68)
+        return 1
 
     log("=== 完了 ===")
     return 0

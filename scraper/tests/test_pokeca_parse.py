@@ -494,6 +494,104 @@ def test_watchlist_empty_row_reports_reason():
     assert "入力してください" in reason
 
 
+# ---------------------------------------------------------------------------
+# ★買取表の商品名を扱う（実データに基づく）
+# ---------------------------------------------------------------------------
+def test_split_product_name():
+    """商品名から品番を切り出す（買取表からのコピペ想定）。"""
+    cases = [
+        ("リーリエ(エクストラバトルの日) PROMO 397/SM-P", "397/SM-P"),
+        ("ルイージピカチュウ(大) PROMO 296/XY-P", "296/XY-P"),
+        ("アセロラ[SM2+] SR 056/049", "056/049"),
+        ("ゲンガーEX:1ED[XY4] SR 090/088", "090/088"),
+        ("ピカチュウ(マクドナルド) PROMO 020/M-P", "020/M-P"),
+        ("キャプテンピカチュウ(中国語版)[CBB1C] AR 0709/09", "0709/09"),
+        ("ピカチュウV[SI] - 415/414", "415/414"),
+        ("リザードン LV.76[OP1] ★ No.006", "No.006"),   # 旧弾は No. 形式
+    ]
+    for product, expected in cases:
+        hinban, name = pkc.split_product_name(product)
+        assert hinban == expected, (product, hinban)
+        assert name and expected not in name, (product, name)
+
+    # 品番が無い商品名でも壊れない
+    h, n = pkc.split_product_name("ミュウツーEX(20th アニバーサリーフェスタ) PROMO XY-P")
+    assert h == ""
+    assert "ミュウツーEX" in n
+    assert pkc.split_product_name("") == ("", "")
+
+
+def test_classify_product_rejects_other_tcg():
+    """★pokeca-chart.com はポケカ専門。他TCGは「対象外」として区別する。
+
+    照合できないのは入力の誤りではないので、エラー扱いにしない。
+    """
+    assert pkc.classify_product("アセロラ[SM2+] SR 056/049") == "ポケカ"
+    assert pkc.classify_product("リザードンex[SV2a] SAR 201/165") == "ポケカ"
+
+    assert pkc.classify_product("孫悟空 SCR☆☆ FB05-119") == "ドラゴンボールFW"
+    assert pkc.classify_product("ベジータ SR☆ FB02-133") == "ドラゴンボールFW"
+    assert pkc.classify_product("海辺の街でキミと AZKi SSP HOL/W104-082SSP") == "ヴァイスシュヴァルツ"
+    assert pkc.classify_product("まどろみのひと時 エミリア SP RZ/S46-T42SP") == "ヴァイスシュヴァルツ"
+    assert pkc.classify_product("蒼翠の風霊使いウィン QCCU-JP188") == "遊戯王"
+    assert pkc.classify_product("バギー(illust:otton) L OP09-042") == "ワンピースカード"
+    assert pkc.classify_product("【未開封BOX】MANGA BOOSTER 01") == "未開封BOX等"
+    assert pkc.classify_product("拡張パック『フュージョンアーツ』(S8)【未開封BOX】") == "未開封BOX等"
+    assert pkc.classify_product("エナジーマーカー ☆ E-48") == "エナジーマーカー"
+
+    # ヴァイスの品番はポケカの品番として誤検出されないこと
+    h, _ = pkc.split_product_name("海辺の街でキミと AZKi SSP HOL/W104-082SSP")
+    assert h == "", h
+
+
+def test_core_name_strips_set_and_rarity():
+    """買取表の名前から、比較用の核となる名前を作る。"""
+    assert pkc.core_name("アセロラ[SM2+] SR") == "アセロラ"
+    assert pkc.core_name("リザードンex[SV2a] SAR") == "リザードンex".lower()
+    assert pkc.core_name("ピカチュウ&ゼクロムGX[SM9] SR(SA)") == "ピカチュウ&ゼクロムgx"
+    # 括弧の補足は意味を持つので残す
+    assert "(大)" in pkc.core_name("ルイージピカチュウ(大) PROMO")
+
+
+def test_names_match_is_bidirectional():
+    """★包含は双方向。買取表側が長いこともマスタ側が長いこともある。"""
+    # 買取表の方が長い（実データで実際に外れていたケース）
+    assert pkc.names_match("アセロラ[SM2+] SR", "アセロラ")
+    assert pkc.names_match("リザードンex[SV2a] SAR", "リザードンex")
+    # マスタの方が長い
+    assert pkc.names_match("リーリエ", "リーリエ(エクストラバトルの日)")
+    # 別カードは一致しない
+    assert not pkc.names_match("アセロラ[SM2+] SR", "マオ")
+    assert not pkc.names_match("", "アセロラ")
+
+
+def test_watchlist_accepts_product_name_column():
+    """商品名を1列貼るだけで、品番+名前に分解して照合できる。"""
+    master = [{"card_id": "ase-056", "card_name": "アセロラ",
+               "hinban": "056/049", "url": "u"}]
+    watch = [
+        {"商品名": "アセロラ[SM2+] SR 056/049"},
+        {"商品名": "孫悟空 SCR☆☆ FB05-119"},          # 対象外
+        {"商品名": "エナジーマーカー ☆ E-48"},            # 対象外
+    ]
+    out = pkc.resolve_watchlist(None, watch, master)
+    assert out[0]["card_id"] == "ase-056"
+    assert out[0]["品番"] == "056/049"
+    assert "対象外" in out[1]["メモ"] and "ドラゴンボール" in out[1]["メモ"]
+    assert "対象外" in out[2]["メモ"]
+    # 対象外の行は card_id を埋めない（巡回対象にしない）
+    assert not out[1].get("card_id")
+    assert "商品名" in pkc.WATCHLIST_HEADERS
+
+
+def test_resolve_skips_when_master_empty():
+    """★マスタが0件なら照合を試みない（205行のエラーを並べない）。"""
+    watch = [{"商品名": f"カード{i} 00{i}/165"} for i in range(5)]
+    out = pkc.resolve_watchlist(None, watch, [])
+    assert len(out) == 5
+    assert all(not r.get("メモ") for r in out), "入力を書き換えないこと"
+
+
 def test_trend_row_has_readable_label():
     """key は機械的なまま、人間向けの名前は label 列に入れる。
 
