@@ -294,7 +294,7 @@ def write_to_sheets(items: list[dict]) -> None:
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=worksheet_name, rows=100, cols=len(HEADERS))
 
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M:%S")
     rows = [HEADERS]
     for it in items:
         rows.append(
