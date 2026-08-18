@@ -217,26 +217,19 @@ def test_trend_undecidable_when_few_valid_days():
     assert pkc.classify_trend(m2) == "判定不可"
 
 
-def test_one_week_is_enough_to_judge():
-    """★直近1週間ぶんの実測があれば方向を判定できる。
+def test_ten_valid_days_are_required_to_judge():
+    """依頼要件どおり、有効観測日が10日未満なら判定不可。"""
+    assert pkc.MIN_VALID_DAYS >= 10
 
-    用途が「2〜3日先にどちらへ動くか」なので、判定開始を1週間にしてある。
-    """
-    assert pkc.MIN_VALID_DAYS == 7
+    m10 = pkc.compute_metrics(_series([200 - i * 3 for i in range(10)]))
+    assert m10["valid_days"] == 10
+    assert pkc.classify_trend(m10) == "下落", m10
+    assert m10["d7"] is not None and m10["d7"] < 0
+    assert float(pkc.suggested_buffer_pct(m10, "下落")) > 0
 
-    # 有効観測7日ちょうどの下落系列
-    m = pkc.compute_metrics(_series([200 - i * 3 for i in range(7)]))
-    assert m["valid_days"] == 7
-    assert pkc.classify_trend(m) == "下落", m
-    # 7日ちょうどでも d7 が出ること (7観測ぶんの幅として計算する)
-    assert m["d7"] is not None and m["d7"] < 0
-    assert float(pkc.suggested_buffer_pct(m, "下落")) > 0
-
-    # 6日では判定不可のまま
-    m6 = pkc.compute_metrics(_series([200 - i * 3 for i in range(6)]))
-    assert m6["valid_days"] == 6
-    assert pkc.classify_trend(m6) == "判定不可"
-    assert m6["d7"] is None
+    m9 = pkc.compute_metrics(_series([200 - i * 3 for i in range(9)]))
+    assert m9["valid_days"] == 9
+    assert pkc.classify_trend(m9) == "判定不可"
 
 
 def test_d7_uses_valid_observations_only():
