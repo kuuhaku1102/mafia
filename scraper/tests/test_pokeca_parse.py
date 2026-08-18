@@ -592,6 +592,96 @@ def test_resolve_skips_when_master_empty():
     assert all(not r.get("メモ") for r in out), "入力を書き換えないこと"
 
 
+# ---------------------------------------------------------------------------
+# ★実際の買取表（品番列 + 名前列）を扱う
+# ---------------------------------------------------------------------------
+def test_missing_hinban_rows_are_not_excluded():
+    """★品番が空でも除外しない（買取表には普通にある）。
+
+    "マオ&スイレン" "ナタネ SR" "アカネ" などは品番が空だが正当なポケカ。
+    名前で照合できるので対象から外してはいけない。
+    """
+    for name in ("マオ&スイレン", "ナタネ SR", "アカネ", "ソニア", "カイ SR",
+                 "(PSA10)レシラムex【BWR】"):
+        assert pkc.classify_product(f" {name}") == "ポケカ", name
+
+    # 商品名を1列に貼った形式のときだけ品番を必須にする
+    assert pkc.classify_product("ポートガス・D・エース P P-074",
+                                require_hinban=True) != "ポケカ"
+
+    master = [{"card_id": "mao", "card_name": "マオ&スイレン", "hinban": "", "url": "u"}]
+    out = pkc.resolve_watchlist(None, [{"品番": "", "名前": "マオ&スイレン"}], master)
+    assert out[0]["card_id"] == "mao"
+
+
+def test_psa10_marker_becomes_condition():
+    """名前の (PSA10) は「鑑定品の相場が見たい」という指定。状態列へ移す。"""
+    assert pkc.extract_condition("(PSA10)リザードンV") == ("PSA10", "リザードンV")
+    assert pkc.extract_condition("（PSA10）レックウザVMAX")[0] == "PSA10"
+    assert pkc.extract_condition("PSA 10 リザードンV")[0] == "PSA10"
+    assert pkc.extract_condition("リザードンV") == ("", "リザードンV")
+
+    master = [{"card_id": "rv", "card_name": "リザードンV", "hinban": "211/172", "url": "u"}]
+    out = pkc.resolve_watchlist(None, [{"品番": "211/172", "名前": "(PSA10)リザードンV"}], master)
+    assert out[0]["状態"] == "PSA10"
+    assert out[0]["card_id"] == "rv"
+    # 名前列そのものは書き換えない（元の入力を残す）
+    assert "PSA10" in out[0]["名前"]
+    assert "状態" in pkc.WATCHLIST_HEADERS
+
+
+def test_store_memo_stripped_for_matching():
+    """★自店メモ（高い方 / 安い方）を落とさないとマスタに当たらない。"""
+    assert pkc.strip_store_memo("ブラッキーVMax（高い方）") == "ブラッキーVMax"
+    assert pkc.strip_store_memo("ニンフィアVMAX 安い方") == "ニンフィアVMAX"
+    assert pkc.names_match("ブラッキーVMax　（高い方）", "ブラッキーVMAX")
+    assert pkc.names_match("ニンフィアVMAX 　安い方", "ニンフィアVMAX")
+    # 別カードには当たらない
+    assert not pkc.names_match("ブラッキーVMax（高い方）", "ニンフィアVMAX")
+
+
+def test_real_watchlist_hinban_variants():
+    """実データの品番の揺れを吸収する。"""
+    cases = {
+        "211/SMｰP": "211/SM-P",   # 半角カナ長音
+        "282/SMｰP": "282/SM-P",
+        "189/SｰP": "189/S-P",
+        "296/XY-p": "296/XY-P",   # 末尾小文字
+        "103/S-p": "103/S-P",
+        "206/165 ": "206/165",    # 末尾スペース
+    }
+    for raw, expected in cases.items():
+        assert pkc.normalize_hinban(raw) == expected, raw
+
+
+def test_real_watchlist_name_variants():
+    """全角英字・全角スペース連続・セル内改行を吸収する。"""
+    assert pkc.normalize_name("ガブリアス＆ギラティナＧＸ　ＳＲ") == "ガブリアス&ギラティナGX SR"
+    assert pkc.normalize_name("ポンチョを着たピカチュウ　　（オレンジリザードン）") == \
+        "ポンチョを着たピカチュウ (オレンジリザードン)"
+    assert pkc.normalize_name("オリジンパルキアV(SA) \n\n") == "オリジンパルキアV(SA)"
+    # ★長音は壊さない（品番用の変換を名前に当ててはいけない）
+    for n in ("ルイージピカチュウ（大）", "ブラッキーVMax", "リーリエ"):
+        assert "-" not in pkc.normalize_name(n).replace("VMax", ""), n
+
+
+def test_duplicate_hinban_flagged():
+    """★品番の重複はデータ側の誤り。勝手に直さず備考で人間に返す。"""
+    master = [{"card_id": "x", "card_name": "まったく別のカード", "hinban": "999/999", "url": "u"}]
+    watch = [
+        {"品番": "060/054", "名前": "ファイヤーサンダーフリーザーGX"},
+        {"品番": "060/054", "名前": "ガブリアス＆ギラティナＧＸ　ＳＲ"},
+        {"品番": "055/050", "名前": "マオ"},
+        {"品番": "055/050", "名前": "ルザミーネ（白）"},
+        {"品番": "119/114", "名前": "リーリエ"},
+    ]
+    out = pkc.resolve_watchlist(None, watch, master)
+    flagged = [r for r in out if "品番重複" in (r.get("メモ") or "")]
+    assert len(flagged) == 4, [r.get("メモ") for r in out]
+    # 重複していない行には印を付けない
+    assert "品番重複" not in (out[4].get("メモ") or "")
+
+
 def test_trend_row_has_readable_label():
     """key は機械的なまま、人間向けの名前は label 列に入れる。
 

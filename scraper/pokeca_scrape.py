@@ -182,7 +182,7 @@ MASTER_HEADERS = ["card_id", "card_name", "hinban", "url", "last_seen_at"]
 # 5秒間隔・1日1回では全カードを回りきれないので、実運用ではこれで絞る。
 # 商品名を1列に貼り付けるだけでも使えるようにする（買取表からのコピペ想定）。
 # 品番と名前はスクリプトが商品名から切り出して埋める。
-WATCHLIST_HEADERS = ["商品名", "品番", "名前", "card_id", "url", "メモ"]
+WATCHLIST_HEADERS = ["商品名", "品番", "名前", "状態", "card_id", "url", "メモ"]
 # ★対象カードの現況ボード。毎朝これを見て買取価格を決める想定。
 # 履歴は pkc_card_history / pkc_trend が持つので、こちらは
 # 「1銘柄1行の最新状態」を上書き更新する view として扱う (行は増やさない)。
@@ -831,12 +831,19 @@ def normalize_name(raw: str) -> str:
 # 未開封BOX なども混ざっているが、これらはこのサイトには載っていない。
 # 照合できないのは入力の誤りではないので、「対象外」として区別する。
 OTHER_TCG_PATTERNS = [
+    # 型番で見分けられるもの
     ("ドラゴンボールFW", r"\b(?:FB|SB|FS)\d{2}-\d{2,3}\b"),
     ("ヴァイスシュヴァルツ", r"\b[A-Z][A-Za-z]{1,4}/[SW]\w?\d+-[A-Z]?\d+[A-Z+]*\b"),
     ("遊戯王", r"\b[A-Z0-9]{3,6}-JP[A-Z]?\d{2,3}\b"),
     ("ワンピースカード", r"\b(?:OP|ST|EB)\d{2}-\d{3}\b"),
     ("未開封BOX等", r"【未開封BOX】|未開封BOX|拡張パック|強化拡張パック|スタートデッキ|ハイクラスパック"),
     ("エナジーマーカー", r"エナジーマーカー"),
+    # 型番が崩れている行のための語句判定。
+    # ポケカでは使われない表記だけを挙げる（★ はポケカでも使うので入れない）。
+    ("ドラゴンボールFW", r"(?<=[A-Za-z])[☆★]"),          # "SCR☆☆" "R☆" "L☆"
+    ("遊戯王", r"レリーフ|プリズマティックシークレット|クォーターセンチュリーシークレット|20thシークレット"),
+    ("ワンピースカード", r"illust:|パラレル|漫画絵|金文字"),
+    ("ヴァイスシュヴァルツ", r"\bSSP\b|\bSEC\+|\bSIP\b"),
 ]
 
 # ポケカの品番。"397/SM-P" "056/049" "0709/09" "020/M-P" などに当たる。
@@ -849,21 +856,71 @@ _HINBAN_RE = re.compile(
 _NO_RE = re.compile(r"\bNo\.\s*(\d{1,4})\b", re.IGNORECASE)
 
 
+# 買取表の名前に混ざる (PSA10) は「鑑定品の相場が見たい」という指定。
+# 状態として切り出し、照合に使う名前からは外す。
+_PSA_RE = re.compile(r"[（(]?\s*(PSA|BGS|CGC)\s*(10|9\.5|9)\s*[)）]?", re.IGNORECASE)
+
+# 自店の管理メモ。照合前に落とす（落とさないと別カード扱いになる）。
+STORE_MEMO_WORDS = ["高い方", "安い方", "高いほう", "安いほう", "要確認"]
+_STORE_MEMO_RE = re.compile(
+    r"[（(\[【]?\s*(?:" + "|".join(re.escape(w) for w in STORE_MEMO_WORDS) + r")\s*[)）\]】]?"
+)
+
+
+def extract_condition(name: str) -> tuple[str, str]:
+    """名前から鑑定表記を取り出す。
+
+      "(PSA10)リザードンV" -> ("PSA10", "リザードンV")
+      "リザードンV"        -> ("", "リザードンV")
+    """
+    t = unicodedata.normalize("NFKC", name or "")
+    m = _PSA_RE.search(t)
+    if not m:
+        return "", t.strip()
+    cond = f"{m.group(1).upper()}{m.group(2)}"
+    return cond, (t[: m.start()] + " " + t[m.end():]).strip()
+
+
+def strip_store_memo(name: str) -> str:
+    """自店メモ（高い方 / 安い方 など）を落とす。
+
+    落とさないと「ブラッキーVMax（高い方）」がマスタの「ブラッキーVMAX」に
+    当たらなくなる。ただし名前列そのものからは消さない（2行を区別するため）、
+    照合に使う文字列だけで落とす。
+    """
+    t = _STORE_MEMO_RE.sub(" ", name or "")
+    t = re.sub(r"[（(\[【]\s*[)）\]】]", " ", t)
+    return _SPACE_RE.sub(" ", t).strip()
+
+
 def _tidy_name(name: str) -> str:
     """品番を抜いたあとに残る区切り記号を掃除する ("オカルトマニア[XY] -" -> "...[XY]")。"""
     t = normalize_name(name)
     return re.sub(r"[\s\-–—・/]+$", "", t).strip()
 
 
-def classify_product(name: str) -> str:
+def classify_product(name: str, require_hinban: bool = False) -> str:
     """商品名がポケカか、他TCG等かを判定する。
 
-    戻り値: "ポケカ" もしくは他TCGの名称。
+    戻り値: "ポケカ" もしくは対象外の理由。
+
+    require_hinban:
+      商品名を1列にまとめて貼っただけの行に対してのみ True にする。
+      その形式では型番が崩れた他TCG ("... P P-074" のワンピースのプロモ等) を
+      見分けきれないため、ポケカの品番を持たない行を足切りする。
+
+      ★品番列と名前列に分けて入力された行では False のままにすること。
+      買取表には品番が空の行 ("マオ&スイレン" "ナタネ SR" など) が普通にあり、
+      それらは名前で照合できる正当なポケカなので、除外してはいけない。
     """
     t = unicodedata.normalize("NFKC", name or "")
     for label, pat in OTHER_TCG_PATTERNS:
         if re.search(pat, t):
             return label
+    if require_hinban:
+        hinban, _ = split_product_name(t)
+        if not hinban:
+            return "ポケカ品番なし"
     return "ポケカ"
 
 
@@ -919,7 +976,9 @@ def core_name(name: str) -> str:
       "ピカチュウ&ゼクロムGX[SM9] SR(SA)" -> "ピカチュウ&ゼクロムGX"
     括弧書きの補足 (例: "(大)") は意味を持つことがあるので残す。
     """
-    t = normalize_name(name)
+    _, t = extract_condition(name)       # (PSA10) を落とす
+    t = strip_store_memo(t)              # （高い方）などの自店メモを落とす
+    t = normalize_name(t)
     t = _BRACKET_RE.sub(" ", t)          # [SM2+] 【...】 などを除去
     t = _SYMBOL_RE.sub(" ", t)           # ★ ☆ : - などを除去
     t = _SPACE_RE.sub(" ", t).strip()
@@ -1067,7 +1126,13 @@ def resolve_watchlist(sh, watch: list[dict], master: list[dict]) -> list[dict]:
             row["品番"], row["名前"] = hinban, name
 
         # ★ポケカ以外はこのサイトに載っていない。照合エラーではなく「対象外」。
-        category = classify_product(product or f"{row.get('品番','')} {row.get('名前','')}")
+        # 品番列・名前列に分けて入力された行では品番の有無で足切りしない
+        # （買取表には品番が空のポケカが普通にある）。
+        from_product_only = bool(product) and not (r.get("品番") or r.get("名前"))
+        category = classify_product(
+            product or f"{row.get('品番','')} {row.get('名前','')}",
+            require_hinban=from_product_only,
+        )
         if category != "ポケカ":
             row["メモ"] = f"対象外（{category}）"
             skipped[category] = skipped.get(category, 0) + 1
@@ -1079,6 +1144,13 @@ def resolve_watchlist(sh, watch: list[dict], master: list[dict]) -> list[dict]:
             row["品番"] = normalize_hinban(row["品番"])
         if row.get("名前"):
             row["名前"] = normalize_name(row["名前"])
+
+        # 名前の (PSA10) は「鑑定品の相場が見たい」という指定。状態列へ移す。
+        # 名前列からは消さない（元の入力を残すため）。
+        if not row.get("状態"):
+            cond, _ = extract_condition(row.get("名前", ""))
+            if cond:
+                row["状態"] = cond
 
         if row.get("card_id") or row.get("url"):
             resolved.append(row)
@@ -1096,6 +1168,21 @@ def resolve_watchlist(sh, watch: list[dict], master: list[dict]) -> list[dict]:
             row["メモ"] = reason
             unresolved_labels.append(f"{label} — {reason}")
         resolved.append(row)
+
+    # ★品番の重複はデータ側の誤り。人間に返す（勝手に直さない）。
+    dup: dict[str, int] = {}
+    for r2 in resolved:
+        h = (r2.get("品番") or "").strip()
+        if h:
+            dup[h] = dup.get(h, 0) + 1
+    dups = {h for h, n in dup.items() if n > 1}
+    if dups:
+        for r2 in resolved:
+            if (r2.get("品番") or "").strip() in dups:
+                note = r2.get("メモ") or ""
+                if "品番重複" not in note:
+                    r2["メモ"] = (note + " / " if note else "") + "品番重複（要確認）"
+        log(f"  ! 品番が重複しています（データ側の誤り。備考に印を付けました）: {sorted(dups)}")
 
     # ポケカ以外は「照合できなかった」ではなく「そもそも対象外」。分けて報告する。
     if skipped:
