@@ -186,7 +186,11 @@ CARD_HEADERS = [
 MASTER_HEADERS = ["card_id", "card_name", "hinban", "url", "last_seen_at"]
 # ★対象カードの指定用。品番と名前を手入力すれば、そのカードだけを巡回する。
 # 5秒間隔・1日1回では全カードを回りきれないので、実運用ではこれで絞る。
-WATCHLIST_HEADERS = ["品番", "名前", "card_id", "url", "メモ"]
+WATCHLIST_HEADERS = [
+    "品番", "名前", "card_id", "url", "メモ", "PSA10判定",
+    "3日後上昇%", "3日後横ばい%", "3日後下落%",
+    "3日後基本価格", "3日後価格帯", "3日予測根拠", "3日予測信頼度",
+]
 # ★対象カードの現況ボード。毎朝これを見て買取価格を決める想定。
 # 履歴は pkc_card_history / pkc_trend が持つので、こちらは
 # 「1銘柄1行の最新状態」を上書き更新する view として扱う (行は増やさない)。
@@ -1131,6 +1135,129 @@ def build_status_rows(card_rows: list[dict], only_ids: set | None = None) -> lis
     order = {"下落": 0, "判定不可": 1, "横ばい": 2, "上昇": 3}
     rows.sort(key=lambda r: (order.get(r["傾向"], 9), r.get("品番") or "", r.get("状態") or ""))
     return rows
+
+
+def forecast_psa10_three_days(series: list[dict]) -> dict:
+    """PSA10の直近実測から3日後の方向確率と価格帯を作る。
+
+    未来を断定するモデルではなく、短期モメンタムの警戒指標。取引なしの補完日は
+    compute_metrics / mark_imputed と同じルールで除外する。
+    """
+    marked, basis = mark_imputed(series)
+    valid = [r for r in marked if not r.get("imputed_suspect")]
+    if len(valid) < 5:
+        return {
+            "label": "? PSA10判定不可", "up": 25, "flat": 50, "down": 25,
+            "price": "", "range": "", "reason": f"有効観測{len(valid)}日（5日未満）",
+            "confidence": "低",
+        }
+
+    m = compute_metrics(series)
+    latest = float(valid[-1]["price"])
+    signals = []
+
+    def add_signal(name, value, scale, weight):
+        if value is None:
+            return
+        normalized = max(-1.0, min(1.0, float(value) / scale))
+        signals.append((name, float(value), normalized * weight))
+
+    add_signal("d1", m.get("d1"), 5.0, 20)
+    add_signal("d3", m.get("d3"), 10.0, 30)
+    add_signal("d7", m.get("d7"), 15.0, 20)
+    if m.get("ma5") is not None and m.get("ma20") not in (None, 0):
+        ma_gap = (m["ma5"] / m["ma20"] - 1) * 100
+        add_signal("ma5/ma20", ma_gap, 5.0, 15)
+    add_signal("連続方向", m.get("streak"), 3.0, 15)
+
+    momentum = sum(s[2] for s in signals)
+    coverage = min(1.0, len(valid) / 20)
+    recent_recorded = marked[-7:]
+    recent_valid_ratio = (
+        sum(not r.get("imputed_suspect") for r in recent_recorded) / len(recent_recorded)
+        if recent_recorded else 0
+    )
+    confidence_factor = max(0.25, min(1.0, coverage * recent_valid_ratio))
+    adjusted = momentum * confidence_factor
+
+    # 不確実性が高いほど 25/50/25（横ばい中心）へ戻す。
+    up = 25 + max(adjusted, 0) * 0.45
+    down = 25 + max(-adjusted, 0) * 0.45
+    flat = 100 - up - down
+    probs = [max(5, up), max(10, flat), max(5, down)]
+    total = sum(probs)
+    probs = [round(v / total * 100) for v in probs]
+    probs[1] += 100 - sum(probs)
+    up_i, flat_i, down_i = probs
+
+    if down_i >= max(up_i, flat_i):
+        label = "▼ PSA10下落：注意"
+    elif up_i >= max(down_i, flat_i):
+        label = "▲ PSA10上昇"
+    else:
+        label = "→ PSA10横ばい"
+
+    # d1とd3を日率へ直し、3日分へ外挿。暴走を避け±10%に制限する。
+    daily_parts = []
+    if m.get("d1") is not None:
+        daily_parts.append(float(m["d1"]))
+    if m.get("d3") is not None:
+        daily_parts.append(float(m["d3"]) / 3)
+    daily_move = statistics.mean(daily_parts) if daily_parts else 0
+    forecast_pct = max(-10.0, min(10.0, daily_move * 3 * confidence_factor))
+    forecast_price = round(latest * (1 + forecast_pct / 100))
+    vol = _number(m.get("vol20")) or 0
+    band_pct = max(3.0, min(15.0, vol * math.sqrt(3)))
+    low = round(forecast_price * (1 - band_pct / 100))
+    high = round(forecast_price * (1 + band_pct / 100))
+
+    reasons = []
+    for name, value, _ in sorted(signals, key=lambda x: abs(x[2]), reverse=True)[:3]:
+        unit = "日" if name == "連続方向" else "%"
+        reasons.append(f"{name}={value:.2f}{unit}")
+    if recent_valid_ratio < 0.7:
+        reasons.append(f"直近7件の実測率{recent_valid_ratio * 100:.0f}%")
+    confidence = "高" if confidence_factor >= 0.75 and basis == "trade_count" else "中" if confidence_factor >= 0.45 else "低"
+    return {
+        "label": label, "up": up_i, "flat": flat_i, "down": down_i,
+        "price": forecast_price, "range": f"{low}～{high}",
+        "reason": " / ".join(reasons), "confidence": confidence,
+    }
+
+
+def annotate_watchlist_psa10(watch: list[dict], card_rows: list[dict]) -> list[dict]:
+    """ウォッチリストへPSA10の3日予測を付ける。手入力列はそのまま保つ。"""
+    by_card: dict[str, list[dict]] = {}
+    for r in card_rows or []:
+        if str(r.get("condition", "")).lower() == "psa10" and r.get("card_id"):
+            by_card.setdefault(r["card_id"], []).append(r)
+    out = []
+    for original in watch:
+        row = dict(original)
+        cid = row.get("card_id", "")
+        series = _to_series(by_card.get(cid, []))
+        forecast = forecast_psa10_three_days(series)
+        row["PSA10判定"] = forecast["label"]
+        row["3日後上昇%"] = forecast["up"]
+        row["3日後横ばい%"] = forecast["flat"]
+        row["3日後下落%"] = forecast["down"]
+        row["3日後基本価格"] = forecast["price"]
+        row["3日後価格帯"] = forecast["range"]
+        row["3日予測根拠"] = forecast["reason"]
+        row["3日予測信頼度"] = forecast["confidence"]
+        out.append(row)
+    return out
+
+
+def update_watchlist_psa10(sh, card_rows: list[dict], dry_run: bool) -> int:
+    watch = load_watchlist(sh)
+    if not watch:
+        return 0
+    annotated = annotate_watchlist_psa10(watch, card_rows)
+    upsert_to_sheet(sh, WATCHLIST_WS, WATCHLIST_HEADERS, annotated,
+                    WATCHLIST_KEY_FIELDS, dry_run)
+    log(f"  {WATCHLIST_WS}: PSA10判定を {len(annotated)}件更新")
+    return len(annotated)
 
 
 # ===========================================================================
@@ -2250,6 +2377,7 @@ def run_market_analysis(sh, dry_run: bool) -> int:
         _get_or_create(sh, PSA_SUPPLY_WS, PSA_SUPPLY_HEADERS)
         _get_or_create(sh, LIQUIDITY_WS, LIQUIDITY_HEADERS)
     card_rows = read_history(sh, CARD_WS, CARD_HEADERS)
+    update_watchlist_psa10(sh, card_rows, dry_run)
     index_rows = read_history(sh, INDEX_WS, INDEX_HEADERS)
     supply_rows = read_history(sh, PSA_SUPPLY_WS, PSA_SUPPLY_HEADERS)
     liquidity_rows = read_history(sh, LIQUIDITY_WS, LIQUIDITY_HEADERS)
@@ -2488,6 +2616,7 @@ def main() -> int:
         if status:
             log(f"--- 現況ボードの更新: {len(status)}行 ---")
             upsert_to_sheet(sh, STATUS_WS, STATUS_HEADERS, status, STATUS_KEY_FIELDS, dry_run)
+        update_watchlist_psa10(sh, history, dry_run)
 
     # --- daily は最後に傾向を再計算する (これが出力の本体) ---
     if MODE in ("daily", "backfill"):
