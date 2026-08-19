@@ -102,6 +102,50 @@ def test_upsert_no_duplicate_on_reinsert():
     assert updates3[0][0] == 2  # ヘッダーが1行目なのでデータは2行目から
 
 
+def test_upsert_ignores_fetched_at_only_change():
+    """取得時刻だけの差で履歴全行を再書き込みしない。"""
+    headers = pkc.CARD_HEADERS
+    existing = [[*headers], [
+        "2026-08-18", "card-x", "テスト", "001/100", "PSA10",
+        "10000", "1", "FALSE", "t1",
+    ]]
+    records = [{
+        "date": "2026-08-18", "card_id": "card-x", "condition": "PSA10",
+        "price": "10000", "trade_count": "1", "imputed_suspect": "FALSE",
+        "fetched_at": "t2",
+    }]
+
+    _, appends, updates, stats = pkc.plan_upsert(
+        existing, records, headers, pkc.CARD_KEY_FIELDS
+    )
+
+    assert appends == []
+    assert updates == []
+    assert stats["updated"] == 0
+
+
+def test_upsert_updates_real_change_and_refreshes_fetched_at():
+    """価格が変わった場合は更新し、新しい取得時刻も保存する。"""
+    headers = pkc.CARD_HEADERS
+    existing = [[*headers], [
+        "2026-08-18", "card-x", "テスト", "001/100", "PSA10",
+        "10000", "1", "FALSE", "t1",
+    ]]
+    records = [{
+        "date": "2026-08-18", "card_id": "card-x", "condition": "PSA10",
+        "price": "11000", "trade_count": "1", "imputed_suspect": "FALSE",
+        "fetched_at": "t2",
+    }]
+
+    _, _, updates, stats = pkc.plan_upsert(
+        existing, records, headers, pkc.CARD_KEY_FIELDS
+    )
+
+    assert stats["updated"] == 1
+    assert updates[0][1][headers.index("price")] == "11000"
+    assert updates[0][1][headers.index("fetched_at")] == "t2"
+
+
 def test_upsert_dedupes_within_one_batch():
     """同じ実行内に同じキーが2回来ても1行にまとまる。"""
     headers = pkc.INDEX_HEADERS
