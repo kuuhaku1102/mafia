@@ -166,6 +166,11 @@ MASTER_WS = os.environ.get("PKC_MASTER_WORKSHEET") or "pkc_card_master"
 TREND_WS = os.environ.get("PKC_TREND_WORKSHEET") or "pkc_trend"
 WATCHLIST_WS = os.environ.get("PKC_WATCHLIST_WORKSHEET") or "pkc_watchlist"
 STATUS_WS = os.environ.get("PKC_STATUS_WORKSHEET") or "pkc_card_status"
+ANALYSIS_REQUEST_WS = os.environ.get("PKC_ANALYSIS_REQUEST_WORKSHEET") or "pkc_analysis_requests"
+PSA_SUPPLY_WS = os.environ.get("PKC_PSA_SUPPLY_WORKSHEET") or "pkc_psa_supply"
+LIQUIDITY_WS = os.environ.get("PKC_LIQUIDITY_WORKSHEET") or "pkc_liquidity"
+ANALYSIS_WS = os.environ.get("PKC_ANALYSIS_WORKSHEET") or "pkc_market_analysis"
+ANALYSIS_METRIC_WS = os.environ.get("PKC_ANALYSIS_METRIC_WORKSHEET") or "pkc_analysis_metrics"
 # card モードで調べたい銘柄 (品番 / 名前 / card_id / URL のいずれか)
 CARD_QUERY = (os.environ.get("PKC_CARD_QUERY") or "").strip()
 # ウォッチリストが空のとき、全カードを巡回してよいか (既定: しない)
@@ -195,6 +200,40 @@ TREND_HEADERS = [
     "date", "scope", "key", "label", "d1", "d3", "d7", "ma5", "ma20", "streak", "vol20",
     "valid_days", "trend", "suggested_buffer_pct", "imputation_basis", "fetched_at",
 ]
+ANALYSIS_REQUEST_HEADERS = [
+    "card_id", "カード名", "カード番号", "収録商品・プロモ名", "言語", "グレード",
+    "分析基準日", "カードURL", "有効", "メモ",
+]
+PSA_SUPPLY_HEADERS = [
+    "date", "card_id", "psa10_count", "all_grade_count", "source_url", "fetched_at",
+]
+LIQUIDITY_HEADERS = [
+    "date", "card_id", "record_type", "price", "listing_id", "is_duplicate",
+    "current_listings", "source_url", "fetched_at",
+]
+ANALYSIS_HEADERS = [
+    "分析基準日", "card_id", "カード名", "カード番号", "収録商品", "言語", "グレード",
+    "現在PSA10相場", "7日前", "30日前", "90日前", "180日前",
+    "90日最高値", "最高値日", "90日最安値", "7日騰落率%", "30日騰落率%",
+    "90日騰落率%", "最高値からの下落率%", "価格更新日", "直近取引日", "90日観測数",
+    "未鑑定品相場", "PSA10価格差", "PSA10プレミアム倍率",
+    "PSA10市場指数", "指数7日%", "指数30日%", "指数90日%", "市場相対強度",
+    "PSA10枚数", "全グレード枚数", "PSA10率%", "PSA10_30日増加数", "PSA10_90日増加数",
+    "PSA10_30日増加率%", "PSA10_90日増加率%",
+    "30日成約件数", "90日成約件数", "直近成約日", "成約間隔中央値日",
+    "直近成約価格中央値", "最高成約価格", "最低成約価格", "重複候補数",
+    "現在出品数", "需給吸収率", "販売在庫月数",
+    "価格トレンド点", "相対強度点", "流動性点", "供給リスク点", "価格バランス点",
+    "相場強度スコア", "データ取得率%", "予測信頼度", "市場フェーズ",
+    "1か月上昇%", "1か月横ばい%", "1か月下落%",
+    "3か月上昇%", "3か月横ばい%", "3か月下落%",
+    "強気価格", "基本価格", "弱気価格", "上昇要因", "下落要因",
+    "最重要先行指標", "次回確認条件", "参照URL", "更新日時",
+]
+ANALYSIS_METRIC_HEADERS = [
+    "分析基準日", "card_id", "カード名", "指標", "現在値", "比較値", "変化率",
+    "判定", "取得元", "source_url", "更新日時",
+]
 
 # upsert のキー (これが一意性の定義)
 INDEX_KEY_FIELDS = ["date", "index_type"]
@@ -204,6 +243,8 @@ WATCHLIST_KEY_FIELDS = ["品番", "名前"]
 # 1銘柄(card_id)×状態(condition) で1行。日付をキーに含めないので行が増えない。
 STATUS_KEY_FIELDS = ["card_id", "状態"]
 TREND_KEY_FIELDS = ["date", "scope", "key"]
+ANALYSIS_KEY_FIELDS = ["分析基準日", "card_id"]
+ANALYSIS_METRIC_KEY_FIELDS = ["分析基準日", "card_id", "指標"]
 
 # --- 傾向判定の閾値 -------------------------------------------------------
 # ★非対称に倒すこと (依頼の要件)
@@ -1905,10 +1946,327 @@ def log_trend_summary(rows: list[dict]) -> None:
 
 
 # ===========================================================================
+# 1〜3か月市場分析
+# ===========================================================================
+UNAVAILABLE = "取得不能"
+
+
+def _number(value):
+    """シート値を float にする。取得不能・空欄は None。"""
+    if value in (None, "", UNAVAILABLE):
+        return None
+    try:
+        return float(str(value).replace(",", "").replace("%", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _pct(current, previous):
+    current, previous = _number(current), _number(previous)
+    if current is None or previous in (None, 0):
+        return None
+    return (current / previous - 1) * 100
+
+
+def _display(value, digits=2):
+    if value is None or value == "":
+        return UNAVAILABLE
+    if isinstance(value, float):
+        return round(value, digits)
+    return value
+
+
+def _date_le(date_text: str, as_of: str) -> bool:
+    return bool(date_text and as_of and date_text <= as_of)
+
+
+def _on_or_before(series: list[dict], target: str):
+    rows = [r for r in series if _date_le(r.get("date", ""), target)]
+    return rows[-1] if rows else None
+
+
+def _days_before(as_of: str, days: int) -> str:
+    return (datetime.strptime(as_of, "%Y-%m-%d") - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def _median(values):
+    nums = [_number(v) for v in values]
+    nums = [v for v in nums if v is not None]
+    return statistics.median(nums) if nums else None
+
+
+def _probabilities(score, confidence_factor=1.0, horizon=1):
+    """スコアを確率へ写像する。断定を避け、低取得率ほど横ばいへ寄せる。"""
+    if score is None:
+        return (25, 50, 25)
+    tilt = max(-25.0, min(25.0, (score - 50) * (0.75 if horizon == 1 else 0.9)))
+    tilt *= confidence_factor
+    up = 25 + max(tilt, 0)
+    down = 25 + max(-tilt, 0)
+    flat = 100 - up - down
+    return tuple(int(round(v)) for v in (up, flat, down))
+
+
+def _weighted_score(components: dict) -> tuple[float | None, float]:
+    """取得できた配点だけを100点換算。戻り値は score, coverage。"""
+    available = {k: v for k, v in components.items() if v[1] is not None}
+    total_weight = sum(weight for weight, _ in available.values())
+    if not total_weight:
+        return None, 0.0
+    earned = sum(weight * max(0, min(1, raw)) for weight, raw in available.values())
+    return earned / total_weight * 100, total_weight
+
+
+def _component_scores(d30, relative, sales30, listings, supply30, premium):
+    # 各 raw は 0〜1。中立を0.5とし、極端な値はクリップする。
+    trend = None if d30 is None else 0.5 + max(-25, min(25, d30)) / 50
+    rel = None if relative is None else 0.5 + max(-20, min(20, relative)) / 40
+    if sales30 is None or listings is None:
+        liquidity = None
+    elif listings == 0:
+        liquidity = 1.0 if sales30 > 0 else 0.5
+    else:
+        liquidity = min(1.0, sales30 / listings)
+    # 供給増が大きいほど低得点。増加率が0なら満点ではなく0.75。
+    supply = None if supply30 is None else max(0.0, min(1.0, 0.75 - supply30 / 20))
+    # PSA10倍率1.5〜3倍を中立域、過度なプレミアムは減点。
+    balance = None if premium is None else max(0.0, min(1.0, 1 - abs(premium - 2.25) / 4.5))
+    return {
+        "価格トレンド点": (25, trend), "相対強度点": (20, rel),
+        "流動性点": (20, liquidity), "供給リスク点": (25, supply),
+        "価格バランス点": (10, balance),
+    }
+
+
+def _phase(score, d30, drawdown):
+    if score is None:
+        return "判断不能"
+    if d30 is not None and d30 > 10 and drawdown is not None and drawdown > -5:
+        return "上昇後期"
+    if score >= 65:
+        return "上昇初期"
+    if drawdown is not None and drawdown < -20 and d30 is not None and d30 >= 0:
+        return "底固め"
+    if score < 45:
+        return "調整中"
+    return "判断不能"
+
+
+def build_market_analysis(request: dict, card_rows: list[dict], index_rows: list[dict],
+                          supply_rows: list[dict], liquidity_rows: list[dict]):
+    """1カードの要約行と縦持ち指標行を作る。外部値が無ければ取得不能。"""
+    cid = (request.get("card_id") or "").strip()
+    as_of = parse_date(request.get("分析基準日")) or today_jst()
+    own = [r for r in card_rows if r.get("card_id") == cid and _date_le(r.get("date", ""), as_of)]
+    psa = sorted(_to_series([r for r in own if str(r.get("condition", "")).lower() == "psa10"]),
+                 key=lambda r: r["date"])
+    raw = sorted(_to_series([r for r in own if r.get("condition") == "美品"]), key=lambda r: r["date"])
+    idx = sorted(_to_series([dict(r, price=r.get("value")) for r in index_rows
+                             if str(r.get("index_type", "")).lower() == "psa10"
+                             and _date_le(r.get("date", ""), as_of)]), key=lambda r: r["date"])
+
+    current_row = _on_or_before(psa, as_of)
+    current = current_row.get("price") if current_row else None
+    points = {d: _on_or_before(psa, _days_before(as_of, d)) for d in (7, 30, 90, 180)}
+    prices = {d: (points[d].get("price") if points[d] else None) for d in points}
+    changes = {d: _pct(current, prices[d]) for d in (7, 30, 90)}
+    since90 = [r for r in psa if r["date"] >= _days_before(as_of, 90)]
+    high_row = max(since90, key=lambda r: r["price"]) if since90 else None
+    low_row = min(since90, key=lambda r: r["price"]) if since90 else None
+    drawdown = _pct(current, high_row.get("price") if high_row else None)
+    raw_row = _on_or_before(raw, as_of)
+    raw_price = raw_row.get("price") if raw_row else None
+    premium = (current / raw_price) if current is not None and raw_price not in (None, 0) else None
+
+    index_now_row = _on_or_before(idx, as_of)
+    index_now = index_now_row.get("price") if index_now_row else None
+    index_changes = {}
+    for d in (7, 30, 90):
+        old = _on_or_before(idx, _days_before(as_of, d))
+        index_changes[d] = _pct(index_now, old.get("price") if old else None)
+    relative = None if changes[30] is None or index_changes[30] is None else changes[30] - index_changes[30]
+
+    supply = sorted([r for r in supply_rows if r.get("card_id") == cid and _date_le(r.get("date", ""), as_of)],
+                    key=lambda r: r.get("date", ""))
+    supply_now = _on_or_before(supply, as_of)
+    s30 = _on_or_before(supply, _days_before(as_of, 30))
+    s90 = _on_or_before(supply, _days_before(as_of, 90))
+    psa10_count = _number(supply_now.get("psa10_count")) if supply_now else None
+    all_count = _number(supply_now.get("all_grade_count")) if supply_now else None
+    psa_rate = (psa10_count / all_count * 100) if psa10_count is not None and all_count else None
+    inc30 = psa10_count - _number(s30.get("psa10_count")) if psa10_count is not None and s30 and _number(s30.get("psa10_count")) is not None else None
+    inc90 = psa10_count - _number(s90.get("psa10_count")) if psa10_count is not None and s90 and _number(s90.get("psa10_count")) is not None else None
+    supply30 = _pct(psa10_count, s30.get("psa10_count")) if s30 else None
+    supply90 = _pct(psa10_count, s90.get("psa10_count")) if s90 else None
+
+    liq = [r for r in liquidity_rows if r.get("card_id") == cid and _date_le(r.get("date", ""), as_of)]
+    sales = sorted([r for r in liq if r.get("record_type") == "sale" and str(r.get("is_duplicate", "")) != "1"],
+                   key=lambda r: r.get("date", ""))
+    dupes = len([r for r in liq if r.get("record_type") == "sale" and str(r.get("is_duplicate", "")) == "1"])
+    sales30_rows = [r for r in sales if r.get("date", "") >= _days_before(as_of, 30)]
+    sales90_rows = [r for r in sales if r.get("date", "") >= _days_before(as_of, 90)]
+    listing_snapshots = sorted([r for r in liq if r.get("record_type") == "listing_snapshot"], key=lambda r: r.get("date", ""))
+    listing_row = _on_or_before(listing_snapshots, as_of)
+    listings = _number(listing_row.get("current_listings")) if listing_row else None
+    gaps = []
+    for a, b in zip(sales90_rows, sales90_rows[1:]):
+        gaps.append((datetime.strptime(b["date"], "%Y-%m-%d") - datetime.strptime(a["date"], "%Y-%m-%d")).days)
+    sale_prices = [_number(r.get("price")) for r in sales90_rows if _number(r.get("price")) is not None]
+    recent_prices = [_number(r.get("price")) for r in sales[-10:] if _number(r.get("price")) is not None]
+    absorption = (len(sales30_rows) / listings) if listings not in (None, 0) else None
+    months = (listings / len(sales30_rows)) if listings is not None and sales30_rows else None
+
+    components = _component_scores(changes[30], relative, len(sales30_rows) if liq else None,
+                                   listings, supply30, premium)
+    score, coverage = _weighted_score(components)
+    confidence = "高" if coverage >= 80 else "中" if coverage >= 55 else "低"
+    confidence_factor = max(0.35, coverage / 100)
+    p1 = _probabilities(score, confidence_factor, 1)
+    p3 = _probabilities(score, confidence_factor, 3)
+
+    positives, negatives = [], []
+    if relative is not None and relative > 3: positives.append(f"市場指数より30日で{relative:.1f}pt強い")
+    if relative is not None and relative < -3: negatives.append(f"市場指数より30日で{abs(relative):.1f}pt弱い")
+    if supply30 is not None and supply30 > 5: negatives.append(f"PSA10供給が30日で{supply30:.1f}%増加")
+    if supply30 is not None and supply30 <= 2 and changes[30] is not None and changes[30] >= 0: positives.append("供給増が限定的で価格を維持")
+    if absorption is not None and absorption >= 1: positives.append(f"需給吸収率{absorption:.2f}")
+    if months is not None and months >= 2: negatives.append(f"販売在庫{months:.1f}か月")
+    if changes[30] is not None and changes[30] > 5: positives.append(f"30日騰落率+{changes[30]:.1f}%")
+    if drawdown is not None and drawdown < -15: negatives.append(f"90日高値から{drawdown:.1f}%")
+    if premium is not None and premium > 5: negatives.append(f"PSA10倍率{premium:.2f}倍")
+
+    component_points = {k: (None if raw_score is None else round(weight * raw_score, 1))
+                        for k, (weight, raw_score) in components.items()}
+    base_price = current
+    volatility = statistics.pstdev([r["price"] for r in since90]) / statistics.mean([r["price"] for r in since90]) if len(since90) >= 2 and statistics.mean([r["price"] for r in since90]) else 0.1
+    band = max(0.08, min(0.3, volatility))
+    sources = [request.get("カードURL")]
+    sources += [r.get("source_url") for r in (supply_now, listing_row) if r]
+    sources = [s for s in dict.fromkeys(sources) if s]
+
+    row = {
+        "分析基準日": as_of, "card_id": cid, "カード名": request.get("カード名", ""),
+        "カード番号": request.get("カード番号", ""), "収録商品": request.get("収録商品・プロモ名", ""),
+        "言語": request.get("言語") or "日本語版", "グレード": request.get("グレード") or "PSA10",
+        "現在PSA10相場": _display(current), "7日前": _display(prices[7]), "30日前": _display(prices[30]),
+        "90日前": _display(prices[90]), "180日前": _display(prices[180]),
+        "90日最高値": _display(high_row.get("price") if high_row else None),
+        "最高値日": _display(high_row.get("date") if high_row else None),
+        "90日最安値": _display(low_row.get("price") if low_row else None),
+        "7日騰落率%": _display(changes[7]), "30日騰落率%": _display(changes[30]),
+        "90日騰落率%": _display(changes[90]), "最高値からの下落率%": _display(drawdown),
+        "価格更新日": _display(current_row.get("date") if current_row else None),
+        "直近取引日": _display(next((r["date"] for r in reversed(psa) if r.get("trade_count") and r["trade_count"] > 0), None)),
+        "90日観測数": len(since90), "未鑑定品相場": _display(raw_price),
+        "PSA10価格差": _display(current - raw_price if current is not None and raw_price is not None else None),
+        "PSA10プレミアム倍率": _display(premium), "PSA10市場指数": _display(index_now),
+        "指数7日%": _display(index_changes[7]), "指数30日%": _display(index_changes[30]),
+        "指数90日%": _display(index_changes[90]), "市場相対強度": _display(relative),
+        "PSA10枚数": _display(psa10_count), "全グレード枚数": _display(all_count), "PSA10率%": _display(psa_rate),
+        "PSA10_30日増加数": _display(inc30), "PSA10_90日増加数": _display(inc90),
+        "PSA10_30日増加率%": _display(supply30), "PSA10_90日増加率%": _display(supply90),
+        "30日成約件数": len(sales30_rows) if liq else UNAVAILABLE, "90日成約件数": len(sales90_rows) if liq else UNAVAILABLE,
+        "直近成約日": _display(sales[-1].get("date") if sales else None), "成約間隔中央値日": _display(_median(gaps)),
+        "直近成約価格中央値": _display(_median(recent_prices)), "最高成約価格": _display(max(sale_prices) if sale_prices else None),
+        "最低成約価格": _display(min(sale_prices) if sale_prices else None), "重複候補数": dupes if liq else UNAVAILABLE,
+        "現在出品数": _display(listings), "需給吸収率": _display(absorption),
+        "販売在庫月数": "流動性極小" if listings is not None and not sales30_rows else _display(months),
+        **{k: _display(v, 1) for k, v in component_points.items()},
+        "相場強度スコア": _display(round(score, 1) if score is not None else None),
+        "データ取得率%": round(coverage, 1), "予測信頼度": confidence,
+        "市場フェーズ": _phase(score, changes[30], drawdown),
+        "1か月上昇%": p1[0], "1か月横ばい%": p1[1], "1か月下落%": p1[2],
+        "3か月上昇%": p3[0], "3か月横ばい%": p3[1], "3か月下落%": p3[2],
+        "強気価格": _display(round(base_price * (1 + band)) if base_price else None),
+        "基本価格": _display(round(base_price) if base_price else None),
+        "弱気価格": _display(round(base_price * (1 - band)) if base_price else None),
+        "上昇要因": " / ".join(positives[:5]) or UNAVAILABLE,
+        "下落要因": " / ".join(negatives[:5]) or UNAVAILABLE,
+        "最重要先行指標": (negatives or positives or ["外部データの取得"])[0],
+        "次回確認条件": "30日後、またはPSA10枚数・出品数・成約中央値の更新時",
+        "参照URL": "\n".join(sources) or UNAVAILABLE, "更新日時": timestamp_jst(),
+    }
+    metric_specs = [
+        ("現在PSA10相場", row["現在PSA10相場"], row["30日前"], row["30日騰落率%"], "みんなのポケカ相場"),
+        ("PSA10市場指数", row["PSA10市場指数"], UNAVAILABLE, row["指数30日%"], "みんなのポケカ相場"),
+        ("PSA10枚数", row["PSA10枚数"], _display(s30.get("psa10_count") if s30 else None), row["PSA10_30日増加率%"], "PSA Population Report"),
+        ("30日成約件数", row["30日成約件数"], row["現在出品数"], row["需給吸収率"], "成約・出品履歴"),
+        ("PSA10プレミアム倍率", row["PSA10プレミアム倍率"], row["未鑑定品相場"], UNAVAILABLE, "みんなのポケカ相場"),
+    ]
+    metric_rows = [{
+        "分析基準日": as_of, "card_id": cid, "カード名": row["カード名"], "指標": name,
+        "現在値": now, "比較値": comp, "変化率": change,
+        "判定": UNAVAILABLE if now == UNAVAILABLE else "要監視", "取得元": source,
+        "source_url": row["参照URL"], "更新日時": row["更新日時"],
+    } for name, now, comp, change, source in metric_specs]
+    return row, metric_rows
+
+
+def build_market_analyses(requests, card_rows, index_rows, supply_rows, liquidity_rows):
+    summaries, metrics = [], []
+    for request in requests:
+        if str(request.get("有効", "1")).strip().lower() in ("0", "false", "off", "無効"):
+            continue
+        if not request.get("card_id"):
+            continue
+        summary, detail = build_market_analysis(request, card_rows, index_rows, supply_rows, liquidity_rows)
+        summaries.append(summary)
+        metrics.extend(detail)
+    return summaries, metrics
+
+
+def load_analysis_requests(sh) -> list[dict]:
+    """分析依頼を読む。空ならウォッチリストからPSA10分析依頼を生成する。"""
+    requests = read_history(sh, ANALYSIS_REQUEST_WS, ANALYSIS_REQUEST_HEADERS)
+    requests = [r for r in requests if r.get("card_id") or r.get("カード番号") or r.get("カード名")]
+    if requests:
+        return requests
+    watch = load_watchlist(sh)
+    generated = []
+    for w in watch:
+        if not w.get("card_id"):
+            continue
+        generated.append({
+            "card_id": w.get("card_id", ""), "カード名": w.get("名前", ""),
+            "カード番号": w.get("品番", ""), "収録商品・プロモ名": "",
+            "言語": "日本語版", "グレード": "PSA10", "分析基準日": today_jst(),
+            "カードURL": w.get("url", ""), "有効": "1", "メモ": "ウォッチリストから自動生成",
+        })
+    return generated
+
+
+def run_market_analysis(sh, dry_run: bool) -> int:
+    requests = load_analysis_requests(sh)
+    if not requests:
+        log(f"! {ANALYSIS_REQUEST_WS} に分析対象がありません。card_id を入力してください。")
+        if not dry_run:
+            _get_or_create(sh, ANALYSIS_REQUEST_WS, ANALYSIS_REQUEST_HEADERS)
+            _get_or_create(sh, PSA_SUPPLY_WS, PSA_SUPPLY_HEADERS)
+            _get_or_create(sh, LIQUIDITY_WS, LIQUIDITY_HEADERS)
+        return 0
+    if not dry_run:
+        upsert_to_sheet(sh, ANALYSIS_REQUEST_WS, ANALYSIS_REQUEST_HEADERS, requests,
+                        ["card_id"], dry_run)
+        _get_or_create(sh, PSA_SUPPLY_WS, PSA_SUPPLY_HEADERS)
+        _get_or_create(sh, LIQUIDITY_WS, LIQUIDITY_HEADERS)
+    card_rows = read_history(sh, CARD_WS, CARD_HEADERS)
+    index_rows = read_history(sh, INDEX_WS, INDEX_HEADERS)
+    supply_rows = read_history(sh, PSA_SUPPLY_WS, PSA_SUPPLY_HEADERS)
+    liquidity_rows = read_history(sh, LIQUIDITY_WS, LIQUIDITY_HEADERS)
+    summaries, metrics = build_market_analyses(
+        requests, card_rows, index_rows, supply_rows, liquidity_rows)
+    log(f"  市場分析: {len(summaries)}銘柄 / 指標 {len(metrics)}行")
+    upsert_to_sheet(sh, ANALYSIS_WS, ANALYSIS_HEADERS, summaries, ANALYSIS_KEY_FIELDS, dry_run)
+    upsert_to_sheet(sh, ANALYSIS_METRIC_WS, ANALYSIS_METRIC_HEADERS, metrics,
+                    ANALYSIS_METRIC_KEY_FIELDS, dry_run)
+    return len(summaries)
+
+
+# ===========================================================================
 # main
 # ===========================================================================
 VALID_MODES = ("probe", "backfill", "index", "cards", "master", "trend", "daily",
-               "card", "watchlist")
+               "card", "watchlist", "analysis")
 
 
 def main() -> int:
@@ -2004,6 +2362,11 @@ def main() -> int:
         trends = compute_all_trends(index_rows, card_rows)
         log_trend_summary(trends)
         upsert_to_sheet(sh, TREND_WS, TREND_HEADERS, trends, TREND_KEY_FIELDS, dry_run)
+        log("=== 完了 ===")
+        return 0
+
+    if MODE == "analysis":
+        run_market_analysis(sh, dry_run)
         log("=== 完了 ===")
         return 0
 
@@ -2135,9 +2498,13 @@ def main() -> int:
         log_trend_summary(trends)
         upsert_to_sheet(sh, TREND_WS, TREND_HEADERS, trends, TREND_KEY_FIELDS, dry_run)
 
+        log("--- 1〜3か月市場分析 ---")
+        run_market_analysis(sh, dry_run)
+
     log("=== 完了 ===")
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
