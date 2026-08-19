@@ -183,6 +183,46 @@ def test_market_analysis_marks_missing_external_data_unavailable():
     assert row["予測信頼度"] == "低"
 
 
+def test_watchlist_psa10_annotation_warns_on_decline_and_keeps_flat():
+    watch = [
+        {"品番": "001/100", "名前": "下落カード", "card_id": "down", "メモ": "残す"},
+        {"品番": "002/100", "名前": "横ばいカード", "card_id": "flat", "メモ": "残す"},
+    ]
+    rows = []
+    for i in range(20):
+        date = f"2026-08-{i + 1:02d}"
+        rows.append({"date": date, "card_id": "down", "card_name": "下落カード",
+                     "hinban": "001/100", "condition": "psa10",
+                     "price": 20000 - i * 300, "trade_count": 2})
+        rows.append({"date": date, "card_id": "flat", "card_name": "横ばいカード",
+                     "hinban": "002/100", "condition": "psa10",
+                     "price": 10000, "trade_count": 2})
+    annotated = pkc.annotate_watchlist_psa10(watch, rows)
+    assert annotated[0]["PSA10判定"] == "▼ PSA10下落：注意"
+    assert annotated[1]["PSA10判定"] == "→ PSA10横ばい"
+    assert annotated[0]["3日後下落%"] > annotated[0]["3日後上昇%"]
+    assert annotated[1]["3日後横ばい%"] >= annotated[1]["3日後上昇%"]
+    assert annotated[0]["3日後基本価格"] < 20000 - 19 * 300
+    assert annotated[0]["3日予測信頼度"] in ("中", "高")
+    assert annotated[0]["メモ"] == "残す"
+
+
+def test_three_day_forecast_is_psa10_only_and_handles_sparse_data():
+    sparse = pkc.forecast_psa10_three_days(
+        [{"date": f"2026-08-0{i + 1}", "price": 10000, "trade_count": 1} for i in range(4)]
+    )
+    assert sparse["label"] == "? PSA10判定不可"
+    assert (sparse["up"], sparse["flat"], sparse["down"]) == (25, 50, 25)
+
+    rising = pkc.forecast_psa10_three_days(
+        [{"date": f"2026-08-{i + 1:02d}", "price": 10000 + i * 200, "trade_count": 2}
+         for i in range(20)]
+    )
+    assert rising["up"] > rising["down"]
+    assert rising["price"] > 10000 + 19 * 200
+    assert rising["range"]
+
+
 # ---------------------------------------------------------------------------
 # ★補完日の検出と除外 (このスクレイパーの成否を分ける部分)
 # ---------------------------------------------------------------------------
