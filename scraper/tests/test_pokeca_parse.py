@@ -419,6 +419,27 @@ def test_match_cards_ranking():
     assert len(hits) == 2  # 候補は絞らず全部返して人間に選ばせる
 
 
+def test_name_partial_match_ignores_annotations_and_symbols():
+    assert pkc.names_partially_match(
+        "ファイヤーサンダーフリーザーGX",
+        "ファイヤー&サンダー&フリーザーGX [SM10b 060/054]",
+    )
+    assert pkc.names_partially_match(
+        "ガブリアス＆ギラティナＧＸ ＳＲ",
+        "ガブリアス&ギラティナGX [SM10b 060/054]",
+    )
+    assert not pkc.names_partially_match("ガブリアス", "ファイヤー&サンダー&フリーザーGX")
+
+
+def test_walk_decrypted_api_payloads():
+    chart = [{"date": "2026-08-18", "price_01": 95000,
+              "price_02": 47000, "price_03": 680000, "volume": 3}]
+    assert pkc.walk_chart_rows({"data": chart})[0][1] == chart
+    item = {"nItemId": 168, "strSlug": "sm10b-060-054",
+            "strName": "ファイヤー&サンダー&フリーザーGX [SM10b 060/054]"}
+    assert pkc.walk_item_records({"items": {"168": item}}) == [item]
+
+
 def test_trend_row_has_readable_label():
     """key は機械的なまま、人間向けの名前は label 列に入れる。
 

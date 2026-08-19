@@ -108,5 +108,6 @@ jobs:
             pkc_probe_screenshot.png
             pkc_probe_text.txt
             pkc_probe_network.json
+            pkc_probe_parsed.json
           if-no-files-found: ignore
           retention-days: 7
