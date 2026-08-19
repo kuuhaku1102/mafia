@@ -127,6 +127,62 @@ def test_upsert_preserves_extra_columns():
     assert updated_row[header.index("value")] == "111"
 
 
+def test_market_analysis_uses_available_data_without_fabrication():
+    request = {
+        "card_id": "card-x", "カード名": "テストカード", "カード番号": "001/100",
+        "収録商品・プロモ名": "テストパック", "分析基準日": "2026-08-18",
+        "カードURL": "https://pokeca-chart.com/card-x/", "有効": "1",
+    }
+    card_rows = []
+    for i in range(181):
+        day = pkc.datetime(2026, 2, 19) + pkc.timedelta(days=i)
+        date = day.strftime("%Y-%m-%d")
+        card_rows.append({"date": date, "card_id": "card-x", "condition": "psa10",
+                          "price": 10000 + i * 10, "trade_count": 1})
+        card_rows.append({"date": date, "card_id": "card-x", "condition": "美品",
+                          "price": 5000, "trade_count": 1})
+    index_rows = []
+    for i in range(91):
+        day = pkc.datetime(2026, 5, 20) + pkc.timedelta(days=i)
+        index_rows.append({"date": day.strftime("%Y-%m-%d"), "index_type": "psa10",
+                           "value": 1000 + i})
+    supply = [
+        {"date": "2026-07-19", "card_id": "card-x", "psa10_count": "100", "all_grade_count": "200",
+         "source_url": "https://www.psacard.com/Pop"},
+        {"date": "2026-08-18", "card_id": "card-x", "psa10_count": "110", "all_grade_count": "220",
+         "source_url": "https://www.psacard.com/Pop"},
+    ]
+    liquidity = [
+        {"date": "2026-08-01", "card_id": "card-x", "record_type": "sale", "price": "12000",
+         "listing_id": "a", "is_duplicate": "", "source_url": "https://example.com/a"},
+        {"date": "2026-08-10", "card_id": "card-x", "record_type": "sale", "price": "11800",
+         "listing_id": "b", "is_duplicate": "", "source_url": "https://example.com/b"},
+        {"date": "2026-08-18", "card_id": "card-x", "record_type": "listing_snapshot",
+         "current_listings": "4", "source_url": "https://example.com/listings"},
+    ]
+    row, metrics = pkc.build_market_analysis(request, card_rows, index_rows, supply, liquidity)
+    assert row["現在PSA10相場"] == 11800
+    assert row["PSA10プレミアム倍率"] == 2.36
+    assert row["PSA10枚数"] == 110.0
+    assert row["PSA10_30日増加率%"] == 10.0
+    assert row["30日成約件数"] == 2
+    assert row["販売在庫月数"] == 2.0
+    assert 0 <= row["相場強度スコア"] <= 100
+    assert row["1か月上昇%"] + row["1か月横ばい%"] + row["1か月下落%"] == 100
+    assert len(metrics) == 5
+
+
+def test_market_analysis_marks_missing_external_data_unavailable():
+    request = {"card_id": "x", "カード名": "X", "分析基準日": "2026-08-18", "有効": "1"}
+    rows = [{"date": "2026-08-18", "card_id": "x", "condition": "psa10",
+             "price": 10000, "trade_count": 1}]
+    row, _ = pkc.build_market_analysis(request, rows, [], [], [])
+    assert row["PSA10枚数"] == pkc.UNAVAILABLE
+    assert row["30日成約件数"] == pkc.UNAVAILABLE
+    assert row["現在出品数"] == pkc.UNAVAILABLE
+    assert row["予測信頼度"] == "低"
+
+
 # ---------------------------------------------------------------------------
 # ★補完日の検出と除外 (このスクレイパーの成否を分ける部分)
 # ---------------------------------------------------------------------------
@@ -614,3 +670,4 @@ if __name__ == "__main__":
             fn()
             print(f"  ok {name}")
     print("ALL TESTS PASSED")
+
