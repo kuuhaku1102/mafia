@@ -183,6 +183,26 @@ def test_market_analysis_marks_missing_external_data_unavailable():
     assert row["予測信頼度"] == "低"
 
 
+def test_watchlist_psa10_annotation_warns_on_decline_and_keeps_flat():
+    watch = [
+        {"品番": "001/100", "名前": "下落カード", "card_id": "down", "メモ": "残す"},
+        {"品番": "002/100", "名前": "横ばいカード", "card_id": "flat", "メモ": "残す"},
+    ]
+    rows = []
+    for i in range(20):
+        date = f"2026-08-{i + 1:02d}"
+        rows.append({"date": date, "card_id": "down", "card_name": "下落カード",
+                     "hinban": "001/100", "condition": "psa10",
+                     "price": 20000 - i * 300, "trade_count": 2})
+        rows.append({"date": date, "card_id": "flat", "card_name": "横ばいカード",
+                     "hinban": "002/100", "condition": "psa10",
+                     "price": 10000, "trade_count": 2})
+    annotated = pkc.annotate_watchlist_psa10(watch, rows)
+    assert annotated[0]["PSA10判定"] == "▼ PSA10下落：注意"
+    assert annotated[1]["PSA10判定"] == "→ PSA10横ばい"
+    assert annotated[0]["メモ"] == "残す"
+
+
 # ---------------------------------------------------------------------------
 # ★補完日の検出と除外 (このスクレイパーの成否を分ける部分)
 # ---------------------------------------------------------------------------

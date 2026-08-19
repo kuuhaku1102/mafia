@@ -186,7 +186,7 @@ CARD_HEADERS = [
 MASTER_HEADERS = ["card_id", "card_name", "hinban", "url", "last_seen_at"]
 # ★対象カードの指定用。品番と名前を手入力すれば、そのカードだけを巡回する。
 # 5秒間隔・1日1回では全カードを回りきれないので、実運用ではこれで絞る。
-WATCHLIST_HEADERS = ["品番", "名前", "card_id", "url", "メモ"]
+WATCHLIST_HEADERS = ["品番", "名前", "card_id", "url", "メモ", "PSA10判定"]
 # ★対象カードの現況ボード。毎朝これを見て買取価格を決める想定。
 # 履歴は pkc_card_history / pkc_trend が持つので、こちらは
 # 「1銘柄1行の最新状態」を上書き更新する view として扱う (行は増やさない)。
@@ -1131,6 +1131,41 @@ def build_status_rows(card_rows: list[dict], only_ids: set | None = None) -> lis
     order = {"下落": 0, "判定不可": 1, "横ばい": 2, "上昇": 3}
     rows.sort(key=lambda r: (order.get(r["傾向"], 9), r.get("品番") or "", r.get("状態") or ""))
     return rows
+
+
+def annotate_watchlist_psa10(watch: list[dict], card_rows: list[dict]) -> list[dict]:
+    """ウォッチリストへPSA10の最新傾向を付ける。手入力列はそのまま保つ。"""
+    wanted = {r.get("card_id") for r in watch if r.get("card_id")}
+    status_rows = build_status_rows(card_rows, only_ids=wanted or set())
+    trends = {
+        r.get("card_id"): r.get("傾向", "判定不可")
+        for r in status_rows
+        if str(r.get("状態", "")).lower() == "psa10"
+    }
+    labels = {
+        "下落": "▼ PSA10下落：注意",
+        "横ばい": "→ PSA10横ばい",
+        "上昇": "▲ PSA10上昇",
+        "判定不可": "? PSA10判定不可",
+    }
+    out = []
+    for original in watch:
+        row = dict(original)
+        cid = row.get("card_id", "")
+        row["PSA10判定"] = labels.get(trends.get(cid, "判定不可"), "? PSA10判定不可")
+        out.append(row)
+    return out
+
+
+def update_watchlist_psa10(sh, card_rows: list[dict], dry_run: bool) -> int:
+    watch = load_watchlist(sh)
+    if not watch:
+        return 0
+    annotated = annotate_watchlist_psa10(watch, card_rows)
+    upsert_to_sheet(sh, WATCHLIST_WS, WATCHLIST_HEADERS, annotated,
+                    WATCHLIST_KEY_FIELDS, dry_run)
+    log(f"  {WATCHLIST_WS}: PSA10判定を {len(annotated)}件更新")
+    return len(annotated)
 
 
 # ===========================================================================
@@ -2250,6 +2285,7 @@ def run_market_analysis(sh, dry_run: bool) -> int:
         _get_or_create(sh, PSA_SUPPLY_WS, PSA_SUPPLY_HEADERS)
         _get_or_create(sh, LIQUIDITY_WS, LIQUIDITY_HEADERS)
     card_rows = read_history(sh, CARD_WS, CARD_HEADERS)
+    update_watchlist_psa10(sh, card_rows, dry_run)
     index_rows = read_history(sh, INDEX_WS, INDEX_HEADERS)
     supply_rows = read_history(sh, PSA_SUPPLY_WS, PSA_SUPPLY_HEADERS)
     liquidity_rows = read_history(sh, LIQUIDITY_WS, LIQUIDITY_HEADERS)
@@ -2488,6 +2524,7 @@ def main() -> int:
         if status:
             log(f"--- 現況ボードの更新: {len(status)}行 ---")
             upsert_to_sheet(sh, STATUS_WS, STATUS_HEADERS, status, STATUS_KEY_FIELDS, dry_run)
+        update_watchlist_psa10(sh, history, dry_run)
 
     # --- daily は最後に傾向を再計算する (これが出力の本体) ---
     if MODE in ("daily", "backfill"):
