@@ -1325,7 +1325,15 @@ def plan_upsert(existing_grid, records, headers, key_fields):
             base = grid[rownum - 1] if rownum - 1 < len(grid) else []
             new_row = row_from(record, base)
             old_row = list(base) + [""] * (width - len(base))
-            if new_row != old_row[:width]:
+            # fetched_at は取得処理を実行した時刻であり、相場データそのものではない。
+            # ここを比較対象にすると、同じ履歴を再取得するたびに全行が更新されて
+            # Sheets API の書き込み上限へ到達する。実データが変わったときだけ更新し、
+            # その場合は new_row 側の fetched_at も一緒に保存する。
+            compare_indexes = [
+                i for i, column in enumerate(header) if column != "fetched_at"
+            ]
+            changed = any(new_row[i] != old_row[i] for i in compare_indexes)
+            if changed:
                 updates.append((rownum, new_row))
                 grid[rownum - 1] = new_row
         elif key in added_keys:
@@ -1926,7 +1934,23 @@ def upsert_to_sheet(sh, name: str, headers: list[str], records: list[dict],
         ]
         # まとめて送る (1行ずつ API を叩かない)
         for i in range(0, len(body), 100):
-            ws.batch_update(body[i:i + 100], value_input_option="USER_ENTERED")
+            chunk = body[i:i + 100]
+            for attempt in range(5):
+                try:
+                    ws.batch_update(chunk, value_input_option="USER_ENTERED")
+                    break
+                except Exception as exc:
+                    # gspread.APIError の response は環境によって形が異なるため、
+                    # status_code とメッセージの両方で 429 を判定する。
+                    response = getattr(exc, "response", None)
+                    status = getattr(response, "status_code", None)
+                    quota_exceeded = status == 429 or "429" in str(exc)
+                    if not quota_exceeded or attempt == 4:
+                        raise
+                    wait = 5 * (2 ** attempt)
+                    log(f"  {name}: Sheets API 書き込み上限。{wait}秒後に再試行 "
+                        f"({attempt + 1}/4)")
+                    time.sleep(wait)
 
     if appends:
         ws.append_rows(appends, value_input_option="USER_ENTERED",
