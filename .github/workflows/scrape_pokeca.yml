@@ -12,7 +12,7 @@ on:
         required: false
         default: "daily"
         type: choice
-        options: ["daily", "analysis", "card", "watchlist", "probe", "index", "cards", "master", "trend", "backfill"]
+        options: ["daily", "card", "watchlist", "probe", "index", "cards", "master", "trend", "backfill"]
       card_query:
         description: "card モードで調べる銘柄 (品番 / カード名 / card_id / URL)"
         required: false
@@ -76,11 +76,6 @@ jobs:
           PKC_CARD_QUERY: ${{ github.event.inputs.card_query }}
           PKC_WATCHLIST_WORKSHEET: ${{ vars.PKC_WATCHLIST_WORKSHEET }}
           PKC_STATUS_WORKSHEET: ${{ vars.PKC_STATUS_WORKSHEET }}
-          PKC_ANALYSIS_REQUEST_WORKSHEET: ${{ vars.PKC_ANALYSIS_REQUEST_WORKSHEET }}
-          PKC_PSA_SUPPLY_WORKSHEET: ${{ vars.PKC_PSA_SUPPLY_WORKSHEET }}
-          PKC_LIQUIDITY_WORKSHEET: ${{ vars.PKC_LIQUIDITY_WORKSHEET }}
-          PKC_ANALYSIS_WORKSHEET: ${{ vars.PKC_ANALYSIS_WORKSHEET }}
-          PKC_ANALYSIS_METRIC_WORKSHEET: ${{ vars.PKC_ANALYSIS_METRIC_WORKSHEET }}
           # ウォッチリストが空のとき全カードを巡回してよいか (既定: しない)
           PKC_CRAWL_ALL: ${{ vars.PKC_CRAWL_ALL }}
           PKC_SINCE: ${{ github.event.inputs.since }}
@@ -116,4 +111,3 @@ jobs:
             pkc_probe_parsed.json
           if-no-files-found: ignore
           retention-days: 7
-
