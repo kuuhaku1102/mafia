@@ -1,7 +1,7 @@
 # torecabank 買取リスト スクレイパー
 
 [store.torecabank.com/kaitori_list](https://store.torecabank.com/kaitori_list) の全データを
-毎日朝10時(日本時間)に自動取得し、Google スプレッドシートへ上書き保存します。
+30分おきに自動取得し、Google スプレッドシートへ上書き保存します。
 
 GitHub Actions で実行されるため、サーバーやPCを常時起動する必要はありません。
 
@@ -16,7 +16,7 @@ GitHub Actions で実行されるため、サーバーやPCを常時起動する
   - 在庫 (`.stock` 例: 残り2点 / 受付終了)
   - 受付状態 (募集中 / 受付終了 … `li.item.closed` から判定)
   - 画像URL (`.card img`)
-- `.github/workflows/scrape.yml` … 毎日 01:00 UTC (= 10:00 JST) に実行する定期ジョブ。
+- `.github/workflows/scrape.yml` … 30分おきに実行する定期ジョブ (開始時刻は GitHub Actions の混雑で遅れる場合があります)。
 - 取得結果は Google スプレッドシートの指定シートを **毎回クリアして上書き** します。
 - `#itemCount`(例: 494件) を総件数として読み取り、取得漏れがあれば警告ログを出します。
 
@@ -59,6 +59,14 @@ GitHub Actions で実行されるため、サーバーやPCを常時起動する
 **Actions** タブ →「買取リスト スクレイピング」→ **Run workflow** で手動実行できます。
 `dry_run` に `1` を指定すると、スプレッドシートへ書き込まずログにサンプルを出力します。
 
+### 取得日時の確認
+
+- `bank` シートの G 列「取得日時」は、書き込み直前の日本標準時 (`Asia/Tokyo`, UTC+9) です。
+- 表示形式は `yyyy-mm-dd hh:mm:ss` を毎回設定します。全商品に同じ実行の日時が付きます。
+- 書き込み成功ログにも取得日時と `JST / Asia/Tokyo` を出力します。
+- `dry_run=1` の実行では G 列も更新されません。更新確認時は `dry_run=0` にしてください。
+- 他シートの独自の更新日時欄はこのスクレイパーから書き込んでいません。
+
 ## 任意の調整用 環境変数
 
 | 環境変数 | 説明 |
@@ -66,7 +74,7 @@ GitHub Actions で実行されるため、サーバーやPCを常時起動する
 | `BASE_URL` | 取得対象URL (既定: 買取リストページ) |
 | `MAX_PAGES` | ページ巡回の上限 (既定 100) |
 | `REQUEST_DELAY` | ページ遷移後の待機秒 (既定 1.0) |
-| `WORKSHEET_NAME` | 書き込み先シート名 (既定: 買取リスト) |
+| `WORKSHEET_NAME` | 書き込み先シート名 (既定: bank) |
 | `DRY_RUN` | `1` で書き込みせず動作確認 |
 
 取得に失敗した場合、ジョブは最後に取得した HTML を `debug-page` という名前の
