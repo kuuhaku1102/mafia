@@ -27,9 +27,9 @@ import os
 import re
 import sys
 import time
-from datetime import datetime      # ← 追加
+from datetime import datetime
 from urllib.parse import urljoin
-from zoneinfo import ZoneInfo      # ← 追加
+from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 
@@ -312,8 +312,15 @@ def write_to_sheets(items: list[dict]) -> None:
         )
 
     ws.clear()
-    ws.update(rows, value_input_option="USER_ENTERED")
-    log(f"スプレッドシートへ {len(items)} 件書き込み完了 (シート: {worksheet_name})")
+    ws.update(values=rows, range_name=f"A1:G{len(rows)}", value_input_option="USER_ENTERED")
+    # clear() は既存のセル書式を保持するため、取得日時の書式を毎回明示する。
+    ws.format(f"G2:G{len(rows)}", {
+        "numberFormat": {"type": "DATE_TIME", "pattern": "yyyy-mm-dd hh:mm:ss"},
+    })
+    log(
+        f"スプレッドシートへ {len(items)} 件書き込み完了 "
+        f"(シート: {worksheet_name}, 取得日時: {timestamp} JST / Asia/Tokyo)"
+    )
 
 
 # ---------------------------------------------------------------------------
